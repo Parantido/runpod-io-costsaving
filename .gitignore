@@ -3,15 +3,13 @@
 *.key
 *.pem
 *.secret
+config.sh
 credentials.json
 secrets.json
 
 # Logs
 logs/
 *.log
-
-# Claude
-.claude/
 
 # Python
 __pycache__/
@@ -70,4 +68,5 @@ Thumbs.db
 *.backup
 
 # Claude Code settings (optional - uncomment if you don't want to track)
-# .claude/
+.claude/
+

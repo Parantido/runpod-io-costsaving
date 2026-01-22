@@ -3,7 +3,7 @@
 
 # API Configuration
 API_URL="https://api.drop.co/GPUMachineUpdate"
-VALIDATION_TOKEN="5d6ac3e1-8bce-43d3-b8b7-3bd3a95f5ce0"
+VALIDATION_TOKEN="XXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
 GPU_MACHINE_ID="3"
 
 # Email Configuration
@@ -14,7 +14,7 @@ LOG_DIR="/root/mgmt/runpod/logs"
 LOG_FILE="${LOG_DIR}/runpod.log"
 
 # Retry Configuration
-MAX_WAIT_SECONDS=600       # 10 minutes may be needed for the pod to be online
+MAX_WAIT_SECONDS=600       # 10 minutes may be needed for the pod to be online
 POLL_INTERVAL=5
 
 # GPU Retry Configuration (for initial pod start)
