@@ -242,7 +242,7 @@ class RunPodManager:
         self._run_command(['runpodctl', 'stop', 'pod', self.pod_id])
         
         if wait_for_stopped:
-            return self._wait_for_status('STOPPED', timeout)
+            return self._wait_for_status('EXITED', timeout)
         
         return self.get_pod_info()
     
