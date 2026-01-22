@@ -1,0 +1,73 @@
+# Sensitive files - NEVER commit these
+.apiKey
+*.key
+*.pem
+*.secret
+credentials.json
+secrets.json
+
+# Logs
+logs/
+*.log
+
+# Claude
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# HAR files (may contain sensitive session data)
+*.har
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# Claude Code settings (optional - uncomment if you don't want to track)
+# .claude/
