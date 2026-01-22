@@ -128,6 +128,10 @@ class RunPodManager:
     
     def _parse_pod_output(self, output: str) -> PodInfo:
         """Parse runpodctl output to extract pod information"""
+        
+        # Just for debugging
+        # print(f"Pod infos: {output} ...")
+
         lines = output.strip().split('\n')
 
         # Skip header line, get data line
@@ -146,7 +150,7 @@ class RunPodManager:
         # Find STATUS (looking for RUNNING, STOPPED, etc.)
         status_idx = None
         for i, part in enumerate(parts):
-            if part in ['RUNNING', 'STOPPED', 'STARTING', 'STOPPING']:
+            if part in ['RUNNING', 'STOPPED', 'STARTING', 'STOPPING', 'EXITED']:
                 status_idx = i
                 break
 
@@ -947,6 +951,10 @@ class CloudManager:
         Returns:
             The new pod ID
         """
+        # Clean GPU type ID - remove "1x ", "2x " etc. prefixes from runpodctl format
+        if re.match(r'^\d+x\s+', gpu_type_id):
+            gpu_type_id = re.sub(r'^\d+x\s+', '', gpu_type_id)
+
         # If network volume provided, get its datacenter
         if network_volume_id and not datacenter_id:
             volume_info = self.get_network_volume_info(network_volume_id)
@@ -1289,9 +1297,9 @@ def main():
     else:
         # Legacy pod_id action interface
         parser = argparse.ArgumentParser(description='Manage RunPod pods')
-        parser.add_argument('pod_id', help='Pod ID')
         parser.add_argument('action', choices=['start', 'stop', 'info', 'restart', 'remove'],
                             help='Action to perform on pod')
+        parser.add_argument('pod_id', nargs='?', help='Pod ID')
         parser.add_argument('--container-port', type=int,
                             help='Container port to get mapping for')
         parser.add_argument('--json', action='store_true',
@@ -1928,7 +1936,26 @@ def main():
 
         # Handle pod operations (legacy interface)
         elif args.command is None:
-            manager = RunPodManager(args.pod_id)
+
+            # Revert to the default setting
+            if not hasattr(args, 'pod_id_file') or not args.pod_id_file:
+                pod_id_file = "logs/current_pod_id"
+
+            # Retrieve the pod_id from the command line
+            pod_id = args.pod_id
+
+            # If no pod ID provided, try to read from file
+            if not pod_id and pod_id_file:
+                try:
+                    with open(pod_id_file, 'r') as f:
+                        pod_id = f.read().strip()
+                        if pod_id:
+                            print(f"Read pod ID from file: {pod_id}", file=sys.stderr)
+                except FileNotFoundError:
+                    print(f"Pod ID file not found: {args.pod_id_file}", file=sys.stderr)
+
+            # Initialise with pod id
+            manager = RunPodManager(pod_id)
 
             if args.action == 'start':
                 pod_info = manager.start_pod()
@@ -1966,7 +1993,7 @@ def main():
                 output = {
                     'id': pod_info.id,
                     'name': pod_info.name,
-                    'status': pod_info.status,
+                    'statsa': pod_info.status,
                     'public_ip': pod_info.public_ip,
                     'port_mappings': [
                         {
