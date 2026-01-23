@@ -71,7 +71,7 @@ fi
 
 # Extract IP and port
 PUBLIC_IP=$(echo "$POD_INFO" | jq -r '.public_ip // empty' 2>/dev/null)
-PORT_50051=$(echo "$POD_INFO" | jq -r '.port_mappings[] | select(.container_port==50051) | .public_port // empty' 2>/dev/null)
+PORT_50051=$(echo "$POD_INFO" | jq -r '.port_mappings[] | select(.container_port==50051 and .protocol=="tcp") | .public_port // empty' 2>/dev/null)
 POD_STATUS=$(echo "$POD_INFO" | jq -r '.status // empty' 2>/dev/null)
 
 log "INFO" "Pod status: $POD_STATUS"
