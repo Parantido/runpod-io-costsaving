@@ -10,8 +10,103 @@ import re
 import time
 import json
 import sys
+import os
+import logging
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
+
+# Global debug logger
+_debug_logger = None
+_debug_enabled = False
+
+# Script directory for finding config files
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(SCRIPT_DIR, 'config.sh')
+
+def read_config_value(key: str, default: str = None) -> Optional[str]:
+    """Read a value from config.sh file"""
+    try:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    # Skip comments and empty lines
+                    if not line or line.startswith('#'):
+                        continue
+                    # Parse KEY="value" or KEY=value
+                    if line.startswith(f'{key}='):
+                        value = line.split('=', 1)[1]
+                        # Remove quotes if present
+                        value = value.strip('"\'')
+                        return value
+    except Exception:
+        pass
+    return default
+
+def setup_debug_logging(enabled: bool = None, log_file: str = None):
+    """Setup debug logging if DEBUGGING environment variable is true or explicitly enabled"""
+    global _debug_logger, _debug_enabled
+
+    # Check if debugging should be enabled - check env first, then config.sh
+    if enabled is None:
+        env_debug = os.environ.get('DEBUGGING', '').lower()
+        if env_debug:
+            enabled = env_debug == 'true'
+        else:
+            # Read from config.sh
+            config_debug = read_config_value('DEBUGGING', 'false')
+            enabled = config_debug.lower() == 'true'
+
+    _debug_enabled = enabled
+
+    if not enabled:
+        return
+
+    # Determine log file path - check env first, then config.sh
+    if log_file is None:
+        log_dir = os.environ.get('LOG_DIR', '')
+        if not log_dir:
+            log_dir = read_config_value('LOG_DIR', '/root/mgmt/runpod/logs')
+        log_file = os.path.join(log_dir, 'runpod.log')
+
+    # Ensure log directory exists
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+
+    # Setup logger
+    _debug_logger = logging.getLogger('runpod_debug')
+    _debug_logger.setLevel(logging.DEBUG)
+
+    # Remove existing handlers
+    _debug_logger.handlers = []
+
+    # File handler
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] [python] %(message)s',
+                                  datefmt='%Y-%m-%d %H:%M:%S')
+    file_handler.setFormatter(formatter)
+    _debug_logger.addHandler(file_handler)
+
+    debug_log("INFO", f"Debug logging initialized. Log file: {log_file}")
+
+def debug_log(level: str, message: str):
+    """Log a debug message if debugging is enabled"""
+    global _debug_logger, _debug_enabled
+
+    if not _debug_enabled or _debug_logger is None:
+        return
+
+    level_map = {
+        'DEBUG': logging.DEBUG,
+        'INFO': logging.INFO,
+        'WARN': logging.WARNING,
+        'WARNING': logging.WARNING,
+        'ERROR': logging.ERROR,
+    }
+
+    log_level = level_map.get(level.upper(), logging.INFO)
+    _debug_logger.log(log_level, message)
 
 
 @dataclass
@@ -110,6 +205,8 @@ class RunPodManager:
     
     def _run_command(self, command: List[str]) -> str:
         """Execute a runpodctl command and return output"""
+        cmd_str = ' '.join(command)
+        debug_log("DEBUG", f"Executing command: {cmd_str}")
         try:
             result = subprocess.run(
                 command,
@@ -117,8 +214,11 @@ class RunPodManager:
                 text=True,
                 check=True
             )
+            debug_log("DEBUG", f"Command output: {result.stdout[:500] if result.stdout else '(empty)'}")
             return result.stdout
         except subprocess.CalledProcessError as e:
+            debug_log("ERROR", f"Command failed: {cmd_str}")
+            debug_log("ERROR", f"Stderr: {e.stderr}")
             raise Exception(f"Command failed: {e.stderr}")
     
     def get_pod_info(self) -> PodInfo:
@@ -211,53 +311,61 @@ class RunPodManager:
     def start_pod(self, wait_for_ready: bool = True, timeout: int = 300) -> PodInfo:
         """
         Start the pod and optionally wait for it to be ready
-        
+
         Args:
             wait_for_ready: If True, wait for pod to reach RUNNING status
             timeout: Maximum seconds to wait for pod to start
-        
+
         Returns:
             PodInfo with updated pod information
         """
+        debug_log("INFO", f"Starting pod {self.pod_id}...")
         print(f"Starting pod {self.pod_id}...")
         self._run_command(['runpodctl', 'start', 'pod', self.pod_id])
-        
+
         if wait_for_ready:
+            debug_log("DEBUG", f"Waiting for pod to reach RUNNING status (timeout: {timeout}s)")
             return self._wait_for_status('RUNNING', timeout)
-        
+
         return self.get_pod_info()
-    
+
     def stop_pod(self, wait_for_stopped: bool = True, timeout: int = 120) -> PodInfo:
         """
         Stop the pod and optionally wait for it to be stopped
-        
+
         Args:
             wait_for_stopped: If True, wait for pod to reach STOPPED status
             timeout: Maximum seconds to wait for pod to stop
-        
+
         Returns:
             PodInfo with updated pod information
         """
+        debug_log("INFO", f"Stopping pod {self.pod_id}...")
         print(f"Stopping pod {self.pod_id}...")
         self._run_command(['runpodctl', 'stop', 'pod', self.pod_id])
-        
+
         if wait_for_stopped:
+            debug_log("DEBUG", f"Waiting for pod to reach EXITED status (timeout: {timeout}s)")
             return self._wait_for_status('EXITED', timeout)
-        
+
         return self.get_pod_info()
-    
+
     def _wait_for_status(self, target_status: str, timeout: int) -> PodInfo:
         """Wait for pod to reach target status"""
         start_time = time.time()
-        
+        debug_log("DEBUG", f"Waiting for status: {target_status}")
+
         while True:
             if time.time() - start_time > timeout:
+                debug_log("ERROR", f"Timeout: Pod did not reach {target_status} status within {timeout} seconds")
                 raise TimeoutError(f"Pod did not reach {target_status} status within {timeout} seconds")
-            
+
             pod_info = self.get_pod_info()
+            debug_log("DEBUG", f"Current status: {pod_info.status}")
             print(f"Current status: {pod_info.status}")
-            
+
             if pod_info.status == target_status:
+                debug_log("INFO", f"Pod reached target status: {target_status}")
                 return pod_info
             
             time.sleep(5)
@@ -326,6 +434,9 @@ class CloudManager:
         if operation_name:
             payload["operationName"] = operation_name
 
+        debug_log("DEBUG", f"GraphQL request - operation: {operation_name or 'unnamed'}")
+        debug_log("DEBUG", f"GraphQL variables: {json.dumps(variables) if variables else 'none'}")
+
         data = json.dumps(payload).encode('utf-8')
         req = urllib.request.Request(
             self.RUNPOD_API_URL,
@@ -338,9 +449,13 @@ class CloudManager:
 
         try:
             with urllib.request.urlopen(req) as response:
-                return json.loads(response.read().decode('utf-8'))
+                result = json.loads(response.read().decode('utf-8'))
+                debug_log("DEBUG", f"GraphQL response: {json.dumps(result)[:1000]}")
+                return result
         except urllib.error.HTTPError as e:
-            raise Exception(f"GraphQL API error: {e.code} - {e.read().decode('utf-8')}")
+            error_body = e.read().decode('utf-8')
+            debug_log("ERROR", f"GraphQL API error: {e.code} - {error_body}")
+            raise Exception(f"GraphQL API error: {e.code} - {error_body}")
 
     def get_network_volume_datacenter(self, network_volume_id: str) -> str:
         """
@@ -926,7 +1041,6 @@ class CloudManager:
         volume_in_gb: int = 0,
         min_memory_in_gb: int = 251,
         min_vcpu_count: int = 24,
-        ports: str = "50000/tcp,50051/tcp",
         cloud_type: str = "SECURE"
     ) -> str:
         """
@@ -1005,6 +1119,8 @@ class CloudManager:
         '''
 
         # Build input variables
+        # Note: We explicitly set startJupyter and startSsh to False to ensure
+        # the template's port configuration is used instead of RunPod defaults
         input_vars = {
             "cloudType": cloud_type,
             "containerDiskInGb": container_disk_in_gb,
@@ -1013,12 +1129,10 @@ class CloudManager:
             "gpuTypeId": gpu_type_id,
             "minMemoryInGb": min_memory_in_gb,
             "minVcpuCount": min_vcpu_count,
-            "startJupyter": True,
-            "startSsh": True,
-            "globalNetwork": True,
             "templateId": template_id,
-            "ports": ports,
-            "name": pod_name
+            "name": pod_name,
+            "startJupyter": False,
+            "startSsh": False
         }
 
         if deploy_cost is not None:
@@ -1033,22 +1147,29 @@ class CloudManager:
 
         variables = {"input": input_vars}
 
+        debug_log("INFO", f"Creating pod via GraphQL with GPU {gpu_type_id}")
+        debug_log("INFO", f"Template ID: {template_id}")
+        debug_log("DEBUG", f"Pod creation input_vars: {json.dumps(input_vars)}")
         print(f"Creating pod via GraphQL with GPU {gpu_type_id}...", file=sys.stderr)
         result = self._graphql_query(mutation, variables, "Mutation")
 
         # Check for errors
         if 'errors' in result:
             error_msg = result['errors'][0].get('message', 'Unknown error')
+            debug_log("ERROR", f"GraphQL error creating pod: {error_msg}")
             raise Exception(f"GraphQL error: {error_msg}")
 
         pod_data = result.get('data', {}).get('podFindAndDeployOnDemand')
         if not pod_data:
+            debug_log("ERROR", f"No pod returned from creation. Response: {result}")
             raise Exception(f"No pod returned from creation. Response: {result}")
 
         pod_id = pod_data.get('id')
         if not pod_id:
+            debug_log("ERROR", f"No pod ID in response: {result}")
             raise Exception(f"No pod ID in response: {result}")
 
+        debug_log("INFO", f"Pod created successfully: {pod_id}")
         print(f"Pod created successfully: {pod_id}", file=sys.stderr)
         return pod_id
 
@@ -1203,6 +1324,20 @@ def main():
     """Main entry point with CLI argument parsing"""
     import argparse
 
+    # Ensure PATH includes common binary locations (important for crontab)
+    path_additions = ['/usr/local/bin', '/usr/bin', '/bin', '/usr/local/sbin', '/usr/sbin', '/sbin']
+    current_path = os.environ.get('PATH', '')
+    for p in path_additions:
+        if p not in current_path:
+            current_path = f"{p}:{current_path}" if current_path else p
+    os.environ['PATH'] = current_path
+
+    # Initialize logging early (before argument parsing) to catch any startup issues
+    # This uses config.sh values if environment variables are not set
+    setup_debug_logging()
+    debug_log("INFO", f"Script started. PATH={os.environ.get('PATH', 'NOT SET')}")
+    debug_log("DEBUG", f"Arguments: {sys.argv}")
+
     # Check if first argument is a known subcommand
     subcommands = ['cloud', 'failover', 'create', 'restart-or-recreate', 'clone-pod']
     use_subcommand = len(sys.argv) > 1 and sys.argv[1] in subcommands
@@ -1210,6 +1345,8 @@ def main():
     if use_subcommand:
         # Use subcommand-based parsing
         parser = argparse.ArgumentParser(description='Manage RunPod pods and cloud resources')
+        parser.add_argument('--debug', action='store_true',
+                           help='Enable debug logging (also enabled via DEBUGGING=true env var)')
         subparsers = parser.add_subparsers(dest='command', help='Commands')
 
         # Cloud commands
@@ -1295,17 +1432,29 @@ def main():
 
         args = parser.parse_args()
     else:
-        # Legacy pod_id action interface
+        # Legacy interface: <action> [pod_id] OR <pod_id> <action>
+        # We detect which format based on whether first positional matches an action
         parser = argparse.ArgumentParser(description='Manage RunPod pods')
         parser.add_argument('action', choices=['start', 'stop', 'info', 'restart', 'remove'],
                             help='Action to perform on pod')
-        parser.add_argument('pod_id', nargs='?', help='Pod ID')
+        parser.add_argument('pod_id', nargs='?', help='Pod ID (or read from --pod-id-file)')
         parser.add_argument('--container-port', type=int,
                             help='Container port to get mapping for')
         parser.add_argument('--json', action='store_true',
                             help='Output in JSON format')
+        parser.add_argument('--debug', action='store_true',
+                            help='Enable debug logging (also enabled via DEBUGGING=true env var)')
+        parser.add_argument('--pod-id-file', default='/root/mgmt/runpod/logs/current_pod_id',
+                            help='File to read pod ID from if not provided')
         args = parser.parse_args()
         args.command = None  # Mark as legacy mode
+
+    # If --debug flag was explicitly passed, ensure logging is enabled
+    if getattr(args, 'debug', False):
+        setup_debug_logging(enabled=True)
+
+    # Log the parsed arguments (logging was already initialized at script start)
+    debug_log("DEBUG", f"Parsed args: {args}")
 
     try:
         # Handle cloud commands
@@ -1729,8 +1878,7 @@ def main():
                             container_disk_in_gb=pod_config.container_disk_in_gb,
                             volume_in_gb=pod_config.volume_in_gb,
                             min_memory_in_gb=pod_config.memory_in_gb or 251,
-                            min_vcpu_count=pod_config.vcpu_count or 24,
-                            ports=pod_config.ports
+                            min_vcpu_count=pod_config.vcpu_count or 24
                         )
                         used_gpu = gpu
                         print(f"Successfully created pod {new_pod_id} with {gpu.gpu_type}", file=sys.stderr)
@@ -1871,8 +2019,7 @@ def main():
                     container_disk_in_gb=pod_config.container_disk_in_gb,
                     volume_in_gb=pod_config.volume_in_gb,
                     min_memory_in_gb=pod_config.memory_in_gb or 251,
-                    min_vcpu_count=pod_config.vcpu_count or 24,
-                    ports=pod_config.ports
+                    min_vcpu_count=pod_config.vcpu_count or 24
                 )
             except Exception as e:
                 result = {
@@ -1936,64 +2083,85 @@ def main():
 
         # Handle pod operations (legacy interface)
         elif args.command is None:
+            debug_log("INFO", f"Legacy interface: action={args.action}")
 
-            # Revert to the default setting
-            if not hasattr(args, 'pod_id_file') or not args.pod_id_file:
-                pod_id_file = "logs/current_pod_id"
+            # Get pod_id_file path
+            pod_id_file = getattr(args, 'pod_id_file', '/root/mgmt/runpod/logs/current_pod_id')
 
             # Retrieve the pod_id from the command line
             pod_id = args.pod_id
+            debug_log("DEBUG", f"Pod ID from args: {pod_id}")
 
             # If no pod ID provided, try to read from file
             if not pod_id and pod_id_file:
+                debug_log("DEBUG", f"Attempting to read pod ID from file: {pod_id_file}")
                 try:
                     with open(pod_id_file, 'r') as f:
                         pod_id = f.read().strip()
                         if pod_id:
+                            debug_log("INFO", f"Read pod ID from file: {pod_id}")
                             print(f"Read pod ID from file: {pod_id}", file=sys.stderr)
                 except FileNotFoundError:
-                    print(f"Pod ID file not found: {args.pod_id_file}", file=sys.stderr)
+                    debug_log("ERROR", f"Pod ID file not found: {pod_id_file}")
+                    print(f"Pod ID file not found: {pod_id_file}", file=sys.stderr)
+
+            if not pod_id:
+                debug_log("ERROR", "No pod ID available")
+                raise Exception("No pod ID provided and could not read from file")
+
+            debug_log("INFO", f"Using pod ID: {pod_id}")
 
             # Initialise with pod id
             manager = RunPodManager(pod_id)
 
             if args.action == 'start':
+                debug_log("INFO", f"Starting pod {pod_id}")
                 pod_info = manager.start_pod()
+                debug_log("INFO", f"Pod started successfully. Status: {pod_info.status}")
                 if not args.json:
                     print(f"\n✓ Pod started successfully!")
 
             elif args.action == 'stop':
+                debug_log("INFO", f"Stopping pod {pod_id}")
                 pod_info = manager.stop_pod()
+                debug_log("INFO", f"Pod stopped successfully. Status: {pod_info.status}")
                 if not args.json:
                     print(f"\n✓ Pod stopped successfully!")
 
             elif args.action == 'restart':
+                debug_log("INFO", f"Restarting pod {pod_id}")
                 if not args.json:
                     print("Stopping pod...")
                 manager.stop_pod()
+                debug_log("INFO", f"Pod stopped, now starting...")
                 if not args.json:
                     print("\nStarting pod...")
                 pod_info = manager.start_pod()
+                debug_log("INFO", f"Pod restarted successfully. Status: {pod_info.status}")
                 if not args.json:
                     print(f"\n✓ Pod restarted successfully!")
 
             elif args.action == 'remove':
+                debug_log("INFO", f"Removing pod {pod_id}")
                 manager.remove_pod()
+                debug_log("INFO", f"Pod removed successfully")
                 if args.json:
-                    print(json.dumps({'success': True, 'pod_id': args.pod_id}))
+                    print(json.dumps({'success': True, 'pod_id': pod_id}))
                 else:
-                    print(f"\n✓ Pod {args.pod_id} removed successfully!")
+                    print(f"\n✓ Pod {pod_id} removed successfully!")
                 return
 
             else:  # info
+                debug_log("INFO", f"Getting info for pod {pod_id}")
                 pod_info = manager.get_pod_info()
+                debug_log("INFO", f"Pod info retrieved. Status: {pod_info.status}")
 
             # Display results
             if args.json:
                 output = {
                     'id': pod_info.id,
                     'name': pod_info.name,
-                    'statsa': pod_info.status,
+                    'status': pod_info.status,
                     'public_ip': pod_info.public_ip,
                     'port_mappings': [
                         {
@@ -2028,6 +2196,9 @@ def main():
                         print(f"\nNo mapping found for container port {args.container_port}")
 
     except Exception as e:
+        import traceback
+        debug_log("ERROR", f"Exception occurred: {str(e)}")
+        debug_log("ERROR", f"Traceback: {traceback.format_exc()}")
         if hasattr(args, 'json') and args.json:
             print(json.dumps({'error': str(e)}))
         else:

@@ -60,7 +60,7 @@ fi
 log "INFO" "Fetching pod $POD_ID information..."
 
 # Get pod info
-POD_INFO=$("${SCRIPT_DIR}/runpod_costsaving.py" "$POD_ID" info --json 2>&1)
+POD_INFO=$("${SCRIPT_DIR}/runpod_costsaving.py" --json info "$POD_ID" 2>&1)
 INFO_EXIT_CODE=$?
 
 if [ $INFO_EXIT_CODE -ne 0 ]; then
