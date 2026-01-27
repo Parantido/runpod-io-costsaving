@@ -421,10 +421,11 @@ class CloudManager:
         except FileNotFoundError:
             raise Exception(f"API key file not found: {self.API_KEY_FILE}")
 
-    def _graphql_query(self, query: str, variables: dict = None, operation_name: str = None) -> dict:
-        """Execute a GraphQL query against the RunPod API"""
+    def _graphql_query(self, query: str, variables: dict = None, operation_name: str = None, max_retries: int = 3) -> dict:
+        """Execute a GraphQL query against the RunPod API with browser-like headers and retry logic"""
         import urllib.request
         import urllib.error
+        import time
 
         api_key = self._get_api_key()
 
@@ -438,24 +439,56 @@ class CloudManager:
         debug_log("DEBUG", f"GraphQL variables: {json.dumps(variables) if variables else 'none'}")
 
         data = json.dumps(payload).encode('utf-8')
-        req = urllib.request.Request(
-            self.RUNPOD_API_URL,
-            data=data,
-            headers={
-                'Content-Type': 'application/json',
-                'Authorization': f'Bearer {api_key}'
-            }
-        )
 
-        try:
-            with urllib.request.urlopen(req) as response:
-                result = json.loads(response.read().decode('utf-8'))
-                debug_log("DEBUG", f"GraphQL response: {json.dumps(result)[:1000]}")
-                return result
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode('utf-8')
-            debug_log("ERROR", f"GraphQL API error: {e.code} - {error_body}")
-            raise Exception(f"GraphQL API error: {e.code} - {error_body}")
+        # Build URL with operation name in query string (like the browser does)
+        url = self.RUNPOD_API_URL
+        if operation_name:
+            url = f"{self.RUNPOD_API_URL}?operation={operation_name}"
+
+        # Browser-like headers to avoid Cloudflare bot detection (error 1010)
+        # Note: We omit Accept-Encoding because urllib doesn't auto-decompress gzip/br
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {api_key}',
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': '*/*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Origin': 'https://console.runpod.io',
+            'Referer': 'https://console.runpod.io/',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+        }
+
+        last_error = None
+        last_error_body = None
+        for attempt in range(max_retries):
+            try:
+                # Create a fresh request for each attempt
+                req = urllib.request.Request(url, data=data, headers=headers)
+                with urllib.request.urlopen(req) as response:
+                    result = json.loads(response.read().decode('utf-8'))
+                    debug_log("DEBUG", f"GraphQL response: {json.dumps(result)[:1000]}")
+                    return result
+            except urllib.error.HTTPError as e:
+                error_body = e.read().decode('utf-8')
+                last_error = e
+                last_error_body = error_body
+
+                # Check if it's a Cloudflare rate limit / bot detection error (403 with code 1010)
+                if e.code == 403 and '1010' in error_body:
+                    if attempt < max_retries - 1:
+                        delay = (attempt + 1) * 2  # Exponential backoff: 2s, 4s, 6s
+                        debug_log("DEBUG", f"Cloudflare rate limit detected, retrying in {delay}s (attempt {attempt + 1}/{max_retries})")
+                        time.sleep(delay)
+                        continue
+
+                debug_log("ERROR", f"GraphQL API error: {e.code} - {error_body}")
+                raise Exception(f"GraphQL API error: {e.code} - {error_body}")
+
+        # If we exhausted all retries
+        if last_error:
+            debug_log("ERROR", f"GraphQL API error: {last_error.code} - Max retries exceeded. Last error: {last_error_body}")
+            raise Exception(f"GraphQL API error: {last_error.code} - Max retries exceeded")
 
     def get_network_volume_datacenter(self, network_volume_id: str) -> str:
         """
@@ -694,6 +727,10 @@ class CloudManager:
             except Exception as e:
                 print(f"Warning: Failed to query GPU {gpu_id}: {e}", file=sys.stderr)
                 continue
+
+            # Small delay between GPU queries to avoid Cloudflare rate limiting
+            import time
+            time.sleep(0.3)
 
         return gpus
 
