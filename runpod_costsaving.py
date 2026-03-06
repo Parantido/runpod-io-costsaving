@@ -197,6 +197,300 @@ class CloudGPU:
         return (self.stock_score(), self.ondemand_price, -self.mem_gb)
 
 
+class TelegramNotifier:
+    """Sends alerts to Telegram via Bot API"""
+    
+    LEVEL_EMOJI = {
+        "SUCCESS": "✅",
+        "INFO": "ℹ️",
+        "WARNING": "⚠️",
+        "ERROR": "❌",
+        "CRITICAL": "🚨"
+    }
+    
+    def __init__(self, bot_token: str = None, chat_id: str = None, enabled: bool = True):
+        self.bot_token = bot_token or read_config_value("TELEGRAM_BOT_TOKEN", "")
+        self.chat_id = chat_id or read_config_value("TELEGRAM_CHAT_ID", "")
+        self.enabled = enabled and self.bot_token and self.chat_id
+        if self.enabled:
+            self.api_url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+        else:
+            self.api_url = None
+            if not bot_token and not self.bot_token:
+                debug_log("WARNING", "Telegram notifications disabled: no bot token configured")
+    
+    def send_alert(self, message: str, level: str = "INFO") -> bool:
+        """Send alert to Telegram with emoji indicator"""
+        if not self.enabled:
+            debug_log("DEBUG", f"Telegram disabled, would send [{level}]: {message}")
+            return False
+        
+        emoji = self.LEVEL_EMOJI.get(level, "ℹ️")
+        formatted_message = f"{emoji} *RunPod Alert* [{level}]\n\n{message}"
+        
+        try:
+            import urllib.request
+            import urllib.parse
+            
+            data = urllib.parse.urlencode({
+                "chat_id": self.chat_id,
+                "text": formatted_message,
+                "parse_mode": "Markdown"
+            }).encode("utf-8")
+            
+            req = urllib.request.Request(self.api_url, data=data, method="POST")
+            req.add_header("Content-Type", "application/x-www-form-urlencoded")
+            
+            with urllib.request.urlopen(req, timeout=10) as response:
+                result = json.loads(response.read().decode("utf-8"))
+                if result.get("ok"):
+                    debug_log("DEBUG", f"Telegram alert sent: {level}")
+                    return True
+                else:
+                    debug_log("ERROR", f"Telegram API error: {result}")
+                    return False
+        except Exception as e:
+            debug_log("ERROR", f"Failed to send Telegram alert: {e}")
+            return False
+    
+    def alert_pod_start_failed(self, pod_id: str, pod_name: str, error: str) -> bool:
+        """Alert when pod start fails"""
+        message = (
+            f"*Pod start failed*\n"
+            f"Pod ID: `{pod_id}`\n"
+            f"Name: {pod_name}\n"
+            f"Error: {error}\n\n"
+            f"Attempting to find alternative GPU..."
+        )
+        return self.send_alert(message, "WARNING")
+    
+    def alert_no_gpu_retry(self, datacenter: str, gpu_type: str, retry: int, max_retries: int, 
+                           next_retry_seconds: int) -> bool:
+        """Alert when no GPU available, will retry"""
+        message = (
+            f"*No GPU available*\n"
+            f"Datacenter: {datacenter}\n"
+            f"GPU Type: {gpu_type}\n"
+            f"Retry: {retry}/{max_retries}\n\n"
+            f"Next attempt in {next_retry_seconds // 60} minutes..."
+        )
+        return self.send_alert(message, "WARNING")
+    
+    def alert_no_gpu_final(self, datacenter: str, gpu_type: str, max_price: float, 
+                           attempts: int, total_time_minutes: int) -> bool:
+        """Alert when all GPU retries exhausted"""
+        message = (
+            f"*CRITICAL: No GPU available after all retries*\n"
+            f"Datacenter: {datacenter}\n"
+            f"Required GPU: {gpu_type}\n"
+            f"Max Price: ${max_price:.2f}/hr\n"
+            f"Attempts: {attempts}\n"
+            f"Total wait time: {total_time_minutes} minutes\n\n"
+            f"*Manual intervention required!*"
+        )
+        return self.send_alert(message, "CRITICAL")
+    
+    def alert_pod_recreated(self, old_pod_id: str, new_pod_id: str, pod_name: str,
+                            gpu_type: str, datacenter: str, cost_per_hr: float) -> bool:
+        """Alert when pod successfully recreated"""
+        message = (
+            f"*Pod recreated successfully*\n"
+            f"Old Pod: `{old_pod_id}`\n"
+            f"New Pod: `{new_pod_id}`\n"
+            f"Name: {pod_name}\n"
+            f"GPU: {gpu_type}\n"
+            f"Datacenter: {datacenter}\n"
+            f"Cost: ${cost_per_hr:.2f}/hr"
+        )
+        return self.send_alert(message, "SUCCESS")
+    
+    def alert_pod_started(self, pod_id: str, pod_name: str) -> bool:
+        """Alert when existing pod started successfully"""
+        message = (
+            f"*Pod started successfully*\n"
+            f"Pod ID: `{pod_id}`\n"
+            f"Name: {pod_name}"
+        )
+        return self.send_alert(message, "SUCCESS")
+    
+    def alert_creation_failed(self, gpu_type: str, datacenter: str, error: str, 
+                              attempts: int, total_gpus: int) -> bool:
+        """Alert when pod creation fails for a specific GPU"""
+        message = (
+            f"*Pod creation failed*\n"
+            f"GPU: {gpu_type}\n"
+            f"Datacenter: {datacenter}\n"
+            f"Error: {error}\n"
+            f"Attempt: {attempts}/{total_gpus}"
+        )
+        return self.send_alert(message, "ERROR")
+
+
+class LokiLogger:
+    """Ships structured logs to Loki"""
+    
+    def __init__(self, loki_url: str = None, enabled: bool = True):
+        base_url = loki_url or read_config_value("LOKI_URL", "http://69.167.170.111:3100")
+        self.push_url = f"{base_url}/loki/api/v1/push"
+        self.enabled = enabled and bool(base_url)
+        self.default_labels = {
+            "job": "runpod-costsaving",
+            "host": os.uname().nodename
+        }
+    
+    def log(self, message: str, level: str = "INFO", **extra_labels) -> bool:
+        """Push a log entry to Loki"""
+        if not self.enabled:
+            debug_log("DEBUG", f"Loki disabled, would log [{level}]: {message}")
+            return False
+        
+        # Merge labels
+        labels = {**self.default_labels, "level": level, **extra_labels}
+        
+        # Format labels as Loki expects: {key="value", key2="value2"}
+        label_str = ", ".join(f'{k}="{v}"' for k, v in labels.items())
+        
+        # Timestamp in nanoseconds
+        timestamp_ns = str(int(time.time() * 1_000_000_000))
+        
+        payload = {
+            "streams": [
+                {
+                    "stream": labels,
+                    "values": [[timestamp_ns, message]]
+                }
+            ]
+        }
+        
+        try:
+            import urllib.request
+            
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(self.push_url, data=data, method="POST")
+            req.add_header("Content-Type", "application/json")
+            
+            with urllib.request.urlopen(req, timeout=5) as response:
+                if response.status in (200, 204):
+                    debug_log("DEBUG", f"Loki log shipped: [{level}] {message[:50]}...")
+                    return True
+                else:
+                    debug_log("WARNING", f"Loki returned status {response.status}")
+                    return False
+        except Exception as e:
+            debug_log("WARNING", f"Failed to ship log to Loki: {e}")
+            return False
+    
+    def log_pod_start_attempted(self, pod_id: str, pod_name: str) -> bool:
+        """Log pod start attempt"""
+        return self.log(
+            f"Attempting to start pod {pod_id} ({pod_name})",
+            level="INFO",
+            operation="start",
+            pod_id=pod_id,
+            status="attempting"
+        )
+    
+    def log_pod_start_failed(self, pod_id: str, pod_name: str, error: str) -> bool:
+        """Log pod start failure"""
+        return self.log(
+            f"Pod start failed: {pod_id} ({pod_name}) - {error}",
+            level="ERROR",
+            operation="start",
+            pod_id=pod_id,
+            status="failed"
+        )
+    
+    def log_pod_start_success(self, pod_id: str, pod_name: str) -> bool:
+        """Log pod start success"""
+        return self.log(
+            f"Pod started successfully: {pod_id} ({pod_name})",
+            level="INFO",
+            operation="start",
+            pod_id=pod_id,
+            status="success"
+        )
+    
+    def log_gpu_search(self, datacenter: str, gpu_type: str, retry: int = 0) -> bool:
+        """Log GPU search attempt"""
+        return self.log(
+            f"Searching for GPU in {datacenter}: {gpu_type} (retry {retry})",
+            level="INFO",
+            operation="gpu_search",
+            datacenter=datacenter,
+            retry=str(retry)
+        )
+    
+    def log_no_gpu_available(self, datacenter: str, gpu_type: str, retry: int, max_retries: int) -> bool:
+        """Log no GPU available"""
+        level = "CRITICAL" if retry >= max_retries else "WARNING"
+        status = "no_availability_final" if retry >= max_retries else "no_availability"
+        return self.log(
+            f"No GPU available in {datacenter} for {gpu_type} (retry {retry}/{max_retries})",
+            level=level,
+            operation="gpu_search",
+            datacenter=datacenter,
+            status=status,
+            retry=str(retry)
+        )
+    
+    def log_pod_creation_attempted(self, gpu_type: str, datacenter: str) -> bool:
+        """Log pod creation attempt"""
+        return self.log(
+            f"Attempting to create pod with {gpu_type} in {datacenter}",
+            level="INFO",
+            operation="create",
+            gpu_type=gpu_type,
+            datacenter=datacenter,
+            status="attempting"
+        )
+    
+    def log_pod_creation_failed(self, gpu_type: str, datacenter: str, error: str) -> bool:
+        """Log pod creation failure"""
+        return self.log(
+            f"Pod creation failed with {gpu_type} in {datacenter}: {error}",
+            level="ERROR",
+            operation="create",
+            gpu_type=gpu_type,
+            datacenter=datacenter,
+            status="failed"
+        )
+    
+    def log_pod_created(self, pod_id: str, pod_name: str, gpu_type: str, datacenter: str) -> bool:
+        """Log pod created successfully"""
+        return self.log(
+            f"Pod created: {pod_id} ({pod_name}) with {gpu_type} in {datacenter}",
+            level="INFO",
+            operation="create",
+            pod_id=pod_id,
+            gpu_type=gpu_type,
+            datacenter=datacenter,
+            status="success"
+        )
+    
+    def log_pod_recreated(self, old_pod_id: str, new_pod_id: str, gpu_type: str, datacenter: str) -> bool:
+        """Log pod recreation complete"""
+        return self.log(
+            f"Pod recreated: {old_pod_id} -> {new_pod_id} with {gpu_type} in {datacenter}",
+            level="INFO",
+            operation="recreate",
+            old_pod_id=old_pod_id,
+            new_pod_id=new_pod_id,
+            gpu_type=gpu_type,
+            datacenter=datacenter,
+            status="success"
+        )
+    
+    def log_operation_failed(self, operation: str, error: str, **extra) -> bool:
+        """Log operation failure"""
+        return self.log(
+            f"Operation {operation} failed: {error}",
+            level="CRITICAL",
+            operation=operation,
+            status="failed",
+            **extra
+        )
+
+
 class RunPodManager:
     """Manages RunPod operations"""
     
@@ -1456,6 +1750,18 @@ def main():
         restart_parser.add_argument('--fallback-name', default='failover-pod', help='Name for new pod')
         restart_parser.add_argument('--fallback-min-mem', type=int, default=80, help='Min GPU memory for new pod')
         restart_parser.add_argument('--fallback-min-vcpu', type=int, default=16, help='Min vCPU for new pod')
+        # Retry configuration
+        restart_parser.add_argument('--max-retries', type=int, default=3,
+            help='Maximum number of retry attempts when no GPU available (default: 3)')
+        restart_parser.add_argument('--retry-interval', type=int, default=300,
+            help='Seconds to wait between retry attempts (default: 300 = 5 minutes)')
+        # Telegram alerting configuration
+        restart_parser.add_argument('--telegram-token', help='Telegram bot token (overrides config)')
+        restart_parser.add_argument('--telegram-chat-id', help='Telegram chat ID (overrides config)')
+        restart_parser.add_argument('--no-telegram', action='store_true', help='Disable Telegram alerts')
+        # Loki logging configuration
+        restart_parser.add_argument('--loki-url', help='Loki push URL (overrides config)')
+        restart_parser.add_argument('--no-loki', action='store_true', help='Disable Loki logging')
 
         # Clone-pod command - create a new pod with same config as existing pod
         clone_parser = subparsers.add_parser('clone-pod',
@@ -1740,6 +2046,21 @@ def main():
         # Handle restart-or-recreate command
         elif args.command == 'restart-or-recreate':
             cloud_mgr = CloudManager()
+            
+            # Initialize alerting and logging
+            telegram = TelegramNotifier(
+                bot_token=getattr(args, 'telegram_token', None),
+                chat_id=getattr(args, 'telegram_chat_id', None),
+                enabled=not getattr(args, 'no_telegram', False)
+            )
+            loki = LokiLogger(
+                loki_url=getattr(args, 'loki_url', None),
+                enabled=not getattr(args, 'no_loki', False)
+            )
+            
+            # Retry configuration
+            max_retries = getattr(args, 'max_retries', 3)
+            retry_interval = getattr(args, 'retry_interval', 300)  # 5 minutes
 
             # Step 0: Determine pod ID (from arg, file, or create new)
             pod_id = args.pod_id
@@ -1813,12 +2134,17 @@ def main():
 
             if pod_exists and pod_mgr:
                 print(f"Attempting to start pod {pod_id}...", file=sys.stderr)
+                loki.log_pod_start_attempted(pod_id, pod_config.name)
                 try:
                     pod_info = pod_mgr.start_pod(wait_for_ready=True, timeout=120)
                     restart_success = True
+                    loki.log_pod_start_success(pod_id, pod_config.name)
+                    telegram.alert_pod_started(pod_id, pod_config.name)
                 except Exception as e:
                     start_error = str(e)
                     print(f"Start failed: {start_error}", file=sys.stderr)
+                    loki.log_pod_start_failed(pod_id, pod_config.name, start_error)
+                    telegram.alert_pod_start_failed(pod_id, pod_config.name, start_error)
             else:
                 print("No existing pod to restart. Will create new pod.", file=sys.stderr)
 
@@ -1876,59 +2202,160 @@ def main():
                         pass
 
                 print(f"Looking for GPUs similar to {pod_config.gpu_type_id} ({gpu_mem_gb}GB)...", file=sys.stderr)
-                similar_gpus = cloud_mgr.find_similar_gpus(
-                    target_gpu_type=pod_config.gpu_type_id,
-                    target_mem_gb=gpu_mem_gb,
-                    datacenter_id=datacenter_id,
-                    max_price=args.max_price
-                )
-
-                if not similar_gpus:
-                    result = {
-                        'success': False,
-                        'error': f'No suitable GPU found (max price: ${args.max_price}/hr)',
-                        'pod_id': pod_id,
-                        'original_gpu': pod_config.gpu_type_id
-                    }
-                    if args.json:
-                        print(json.dumps(result))
-                    else:
-                        print(f"Error: {result['error']}", file=sys.stderr)
-                    exit(1)
-
-                # Step 5: Try to create new pod with each GPU until one works
+                
+                # Retry loop for GPU search and pod creation
+                retry_start_time = time.time()
                 new_pod_id = None
                 used_gpu = None
-                errors = []
+                final_errors = []
+                
+                for retry_attempt in range(1, max_retries + 1):
+                    loki.log_gpu_search(datacenter_id or "any", pod_config.gpu_type_id, retry_attempt)
+                    
+                    similar_gpus = cloud_mgr.find_similar_gpus(
+                        target_gpu_type=pod_config.gpu_type_id,
+                        target_mem_gb=gpu_mem_gb,
+                        datacenter_id=datacenter_id,
+                        max_price=args.max_price
+                    )
 
-                for gpu in similar_gpus:
-                    stock_info = f" [{gpu.stock_status}]" if gpu.stock_status else ""
-                    print(f"Trying GPU: {gpu.gpu_type} ({gpu.mem_gb}GB, ${gpu.ondemand_price}/hr){stock_info}...", file=sys.stderr)
-                    try:
-                        new_pod_id = cloud_mgr.create_pod_graphql(
-                            gpu_type_id=gpu.gpu_type,
-                            template_id=pod_config.template_id,
-                            network_volume_id=pod_config.network_volume_id,
-                            datacenter_id=datacenter_id,
-                            pod_name=pod_config.name,
-                            gpu_count=pod_config.gpu_count,
-                            container_disk_in_gb=pod_config.container_disk_in_gb,
-                            volume_in_gb=pod_config.volume_in_gb,
-                            min_memory_in_gb=pod_config.memory_in_gb or 251,
-                            min_vcpu_count=pod_config.vcpu_count or 24
+                    if not similar_gpus:
+                        elapsed_minutes = int((time.time() - retry_start_time) / 60)
+                        loki.log_no_gpu_available(
+                            datacenter_id or "any", 
+                            pod_config.gpu_type_id, 
+                            retry_attempt, 
+                            max_retries
                         )
-                        used_gpu = gpu
-                        print(f"Successfully created pod {new_pod_id} with {gpu.gpu_type}", file=sys.stderr)
+                        
+                        if retry_attempt < max_retries:
+                            # Not final attempt - alert and wait
+                            telegram.alert_no_gpu_retry(
+                                datacenter=datacenter_id or "any",
+                                gpu_type=pod_config.gpu_type_id,
+                                retry=retry_attempt,
+                                max_retries=max_retries,
+                                next_retry_seconds=retry_interval
+                            )
+                            print(f"No GPUs available. Retry {retry_attempt}/{max_retries}. "
+                                  f"Waiting {retry_interval // 60} minutes...", file=sys.stderr)
+                            time.sleep(retry_interval)
+                            continue
+                        else:
+                            # Final attempt failed - send critical alert
+                            total_time_minutes = int((time.time() - retry_start_time) / 60)
+                            telegram.alert_no_gpu_final(
+                                datacenter=datacenter_id or "any",
+                                gpu_type=pod_config.gpu_type_id,
+                                max_price=args.max_price,
+                                attempts=max_retries,
+                                total_time_minutes=total_time_minutes
+                            )
+                            loki.log_operation_failed(
+                                "recreate",
+                                f"No GPU available after {max_retries} attempts",
+                                datacenter=datacenter_id or "any"
+                            )
+                            result = {
+                                'success': False,
+                                'error': f'No suitable GPU found after {max_retries} attempts (max price: ${args.max_price}/hr)',
+                                'pod_id': pod_id,
+                                'original_gpu': pod_config.gpu_type_id,
+                                'datacenter': datacenter_id,
+                                'retry_attempts': max_retries,
+                                'total_wait_minutes': total_time_minutes
+                            }
+                            if args.json:
+                                print(json.dumps(result))
+                            else:
+                                print(f"Error: {result['error']}", file=sys.stderr)
+                            exit(1)
+
+                    # Step 5: Try to create new pod with each GPU until one works
+                    errors = []
+                    gpu_attempt = 0
+                    total_gpus = len(similar_gpus)
+
+                    for gpu in similar_gpus:
+                        gpu_attempt += 1
+                        stock_info = f" [{gpu.stock_status}]" if gpu.stock_status else ""
+                        print(f"Trying GPU: {gpu.gpu_type} ({gpu.mem_gb}GB, ${gpu.ondemand_price}/hr){stock_info}...", file=sys.stderr)
+                        loki.log_pod_creation_attempted(gpu.gpu_type, datacenter_id or "auto")
+                        try:
+                            new_pod_id = cloud_mgr.create_pod_graphql(
+                                gpu_type_id=gpu.gpu_type,
+                                template_id=pod_config.template_id,
+                                network_volume_id=pod_config.network_volume_id,
+                                datacenter_id=datacenter_id,
+                                pod_name=pod_config.name,
+                                gpu_count=pod_config.gpu_count,
+                                container_disk_in_gb=pod_config.container_disk_in_gb,
+                                volume_in_gb=pod_config.volume_in_gb,
+                                min_memory_in_gb=pod_config.memory_in_gb or 251,
+                                min_vcpu_count=pod_config.vcpu_count or 24
+                            )
+                            used_gpu = gpu
+                            loki.log_pod_created(new_pod_id, pod_config.name, gpu.gpu_type, datacenter_id or "auto")
+                            print(f"Successfully created pod {new_pod_id} with {gpu.gpu_type}", file=sys.stderr)
+                            break
+                        except Exception as e:
+                            error_msg = str(e)
+                            print(f"Failed: {error_msg}", file=sys.stderr)
+                            loki.log_pod_creation_failed(gpu.gpu_type, datacenter_id or "auto", error_msg)
+                            errors.append(f"{gpu.gpu_type}: {error_msg}")
+                    
+                    if new_pod_id:
+                        # Successfully created pod, exit retry loop
                         break
-                    except Exception as e:
-                        error_msg = str(e)
-                        print(f"Failed: {error_msg}", file=sys.stderr)
-                        errors.append(f"{gpu.gpu_type}: {error_msg}")
+                    
+                    # All GPUs in this attempt failed
+                    final_errors.extend(errors)
+                    
+                    if retry_attempt < max_retries:
+                        print(f"All {total_gpus} GPUs failed. Retry {retry_attempt}/{max_retries}. "
+                              f"Waiting {retry_interval // 60} minutes...", file=sys.stderr)
+                        telegram.alert_no_gpu_retry(
+                            datacenter=datacenter_id or "any",
+                            gpu_type=pod_config.gpu_type_id,
+                            retry=retry_attempt,
+                            max_retries=max_retries,
+                            next_retry_seconds=retry_interval
+                        )
+                        time.sleep(retry_interval)
+                    else:
+                        # Final attempt - all GPUs failed
+                        total_time_minutes = int((time.time() - retry_start_time) / 60)
+                        telegram.alert_no_gpu_final(
+                            datacenter=datacenter_id or "any",
+                            gpu_type=pod_config.gpu_type_id,
+                            max_price=args.max_price,
+                            attempts=max_retries,
+                            total_time_minutes=total_time_minutes
+                        )
+                        loki.log_operation_failed(
+                            "recreate",
+                            f"Failed to create pod after {max_retries} attempts: {'; '.join(final_errors[-3:])}",
+                            datacenter=datacenter_id or "any"
+                        )
+                        result = {
+                            'success': False,
+                            'error': f'Failed to create pod with any available GPU after {max_retries} attempts. Errors: {"; ".join(final_errors[-5:])}',
+                            'pod_id': pod_id,
+                            'retry_attempts': max_retries,
+                            'total_wait_minutes': total_time_minutes
+                        }
+                        if args.json:
+                            print(json.dumps(result))
+                        else:
+                            print(f"Error: {result['error']}", file=sys.stderr)
+                        exit(1)
 
                 if not new_pod_id:
+                    # This should not be reached due to retry loop, but just in case
+                    loki.log_operation_failed("recreate", "No pod created after retry loop")
                     result = {
                         'success': False,
-                        'error': f'Failed to create pod with any available GPU. Errors: {"; ".join(errors)}',
+                        'error': 'Failed to create pod (unexpected state)',
                         'pod_id': pod_id
                     }
                     if args.json:
@@ -1944,6 +2371,13 @@ def main():
                     new_pod_info = new_pod_mgr._wait_for_status('RUNNING', timeout=300)
                 except TimeoutError as e:
                     print(f"New pod failed to start, cleaning up...", file=sys.stderr)
+                    loki.log_operation_failed("recreate", f"Pod {new_pod_id} failed to reach RUNNING state")
+                    telegram.alert_creation_failed(
+                        used_gpu.gpu_type if used_gpu else "unknown",
+                        datacenter_id or "auto",
+                        f"Timeout waiting for RUNNING state: {e}",
+                        1, 1
+                    )
                     try:
                         cloud_mgr.terminate_pod(new_pod_id)
                     except:
@@ -1977,6 +2411,22 @@ def main():
                         print(f"New pod ID written to {args.pod_id_file}", file=sys.stderr)
                     except Exception as e:
                         print(f"Warning: Failed to write pod ID file: {e}", file=sys.stderr)
+
+                # Send success alerts
+                loki.log_pod_recreated(
+                    pod_id or "none",
+                    new_pod_id,
+                    used_gpu.gpu_type if used_gpu else "unknown",
+                    datacenter_id or "auto"
+                )
+                telegram.alert_pod_recreated(
+                    old_pod_id=pod_id or "none",
+                    new_pod_id=new_pod_id,
+                    pod_name=pod_config.name,
+                    gpu_type=used_gpu.gpu_type if used_gpu else "unknown",
+                    datacenter=datacenter_id or "auto",
+                    cost_per_hr=used_gpu.ondemand_price if used_gpu else 0.0
+                )
 
                 # Return results - action is 'created' if no old pod, 'recreated' if replacing
                 action = 'recreated' if pod_exists else 'created'
