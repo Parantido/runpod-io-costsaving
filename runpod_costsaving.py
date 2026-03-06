@@ -324,6 +324,40 @@ class TelegramNotifier:
             f"Attempt: {attempts}/{total_gpus}"
         )
         return self.send_alert(message, "ERROR")
+    
+    def alert_pod_renamed_to_backup(self, pod_id: str, old_name: str, new_name: str) -> bool:
+        """Alert when pod is renamed to backup before recreation"""
+        message = (
+            f"*Pod renamed to backup*\n"
+            f"Pod ID: `{pod_id}`\n"
+            f"Old Name: {old_name}\n"
+            f"New Name: {new_name}\n\n"
+            f"Attempting to create replacement pod..."
+        )
+        return self.send_alert(message, "INFO")
+    
+    def alert_backup_pod_terminated(self, backup_pod_id: str, backup_name: str,
+                                    new_pod_id: str) -> bool:
+        """Alert when backup pod is terminated after successful recreation"""
+        message = (
+            f"*Backup pod terminated*\n"
+            f"Backup Pod: `{backup_pod_id}` ({backup_name})\n"
+            f"New Pod: `{new_pod_id}`\n\n"
+            f"Recreation complete, backup cleaned up."
+        )
+        return self.send_alert(message, "INFO")
+    
+    def alert_recreation_keeping_backup(self, backup_pod_id: str, backup_name: str,
+                                        new_pod_id: str, reason: str) -> bool:
+        """Alert when backup pod is kept (not terminated) after recreation"""
+        message = (
+            f"*Backup pod kept*\n"
+            f"Backup Pod: `{backup_pod_id}` ({backup_name})\n"
+            f"New Pod: `{new_pod_id}`\n"
+            f"Reason: {reason}\n\n"
+            f"Manual cleanup may be required."
+        )
+        return self.send_alert(message, "WARNING")
 
 
 class LokiLogger:
@@ -488,6 +522,29 @@ class LokiLogger:
             operation=operation,
             status="failed",
             **extra
+        )
+    
+    def log_pod_renamed_to_backup(self, pod_id: str, old_name: str, new_name: str) -> bool:
+        """Log pod renamed to backup"""
+        return self.log(
+            f"Pod renamed to backup: {pod_id} ({old_name} -> {new_name})",
+            level="INFO",
+            operation="rename_backup",
+            pod_id=pod_id,
+            old_name=old_name,
+            new_name=new_name,
+            status="success"
+        )
+    
+    def log_backup_pod_terminated(self, backup_pod_id: str, new_pod_id: str) -> bool:
+        """Log backup pod termination after successful recreation"""
+        return self.log(
+            f"Backup pod terminated: {backup_pod_id} (replaced by {new_pod_id})",
+            level="INFO",
+            operation="terminate_backup",
+            backup_pod_id=backup_pod_id,
+            new_pod_id=new_pod_id,
+            status="success"
         )
 
 
@@ -1530,6 +1587,41 @@ class CloudManager:
 
         return True
 
+    def rename_pod(self, pod_id: str, new_name: str) -> str:
+        """
+        Rename a pod using GraphQL API.
+
+        Args:
+            pod_id: The pod ID to rename
+            new_name: The new name for the pod
+
+        Returns:
+            The new name (as confirmed by API)
+        """
+        mutation = '''
+        mutation editPodName($input: PodEditNameInput!) {
+            podEditName(input: $input) {
+                id
+                name
+            }
+        }
+        '''
+        variables = {"input": {"podId": pod_id, "name": new_name}}
+
+        debug_log("INFO", f"Renaming pod {pod_id} to '{new_name}'")
+        print(f"Renaming pod {pod_id} to '{new_name}'...", file=sys.stderr)
+        result = self._graphql_query(mutation, variables, "editPodName")
+
+        if 'errors' in result:
+            error_msg = result['errors'][0].get('message', 'Unknown error')
+            debug_log("ERROR", f"Failed to rename pod: {error_msg}")
+            raise Exception(f"GraphQL error: {error_msg}")
+
+        pod_data = result.get('data', {}).get('podEditName', {})
+        returned_name = pod_data.get('name', new_name)
+        debug_log("INFO", f"Pod renamed successfully to '{returned_name}'")
+        return returned_name
+
     def _extract_pod_id(self, output: str) -> Optional[str]:
         """Extract pod ID from create pod output"""
         # Look for pod ID pattern (alphanumeric string)
@@ -2177,6 +2269,27 @@ def main():
                 # Step 3: Pod start failed, need to recreate
                 print("Pod restart failed. Attempting to recreate...", file=sys.stderr)
 
+                # Step 3a: Rename old pod to backup (so we can create new pod with same name)
+                backup_pod_id = None
+                backup_pod_name = None
+                original_pod_name = pod_config.name
+                
+                if pod_exists and pod_id:
+                    timestamp = int(time.time())
+                    backup_pod_name = f"{original_pod_name}-backup-{timestamp}"
+                    print(f"Renaming old pod to backup: {backup_pod_name}...", file=sys.stderr)
+                    try:
+                        cloud_mgr.rename_pod(pod_id, backup_pod_name)
+                        backup_pod_id = pod_id
+                        loki.log_pod_renamed_to_backup(pod_id, original_pod_name, backup_pod_name)
+                        telegram.alert_pod_renamed_to_backup(pod_id, original_pod_name, backup_pod_name)
+                        print(f"Old pod renamed to '{backup_pod_name}'", file=sys.stderr)
+                    except Exception as e:
+                        print(f"Warning: Failed to rename old pod: {e}", file=sys.stderr)
+                        print("Will proceed with creation anyway (may need manual cleanup)", file=sys.stderr)
+                        # Change the new pod name to avoid conflict
+                        original_pod_name = f"{pod_config.name}-{timestamp}"
+
                 # Get network volume datacenter for GPU availability query
                 datacenter_id = None
                 if pod_config.network_volume_id:
@@ -2287,7 +2400,7 @@ def main():
                                 template_id=pod_config.template_id,
                                 network_volume_id=pod_config.network_volume_id,
                                 datacenter_id=datacenter_id,
-                                pod_name=pod_config.name,
+                                pod_name=original_pod_name,  # Use original name (old pod was renamed to backup)
                                 gpu_count=pod_config.gpu_count,
                                 container_disk_in_gb=pod_config.container_disk_in_gb,
                                 volume_in_gb=pod_config.volume_in_gb,
@@ -2295,7 +2408,7 @@ def main():
                                 min_vcpu_count=pod_config.vcpu_count or 24
                             )
                             used_gpu = gpu
-                            loki.log_pod_created(new_pod_id, pod_config.name, gpu.gpu_type, datacenter_id or "auto")
+                            loki.log_pod_created(new_pod_id, original_pod_name, gpu.gpu_type, datacenter_id or "auto")
                             print(f"Successfully created pod {new_pod_id} with {gpu.gpu_type}", file=sys.stderr)
                             break
                         except Exception as e:
@@ -2394,14 +2507,20 @@ def main():
                         print(f"Error: {result['error']}", file=sys.stderr)
                     exit(1)
 
-                # Step 7: Terminate old pod (only if it existed)
-                if pod_exists and pod_id:
-                    print(f"Terminating old pod {pod_id}...", file=sys.stderr)
+                # Step 7: Terminate backup pod (the renamed old pod)
+                if backup_pod_id:
+                    print(f"Terminating backup pod {backup_pod_id} ({backup_pod_name})...", file=sys.stderr)
                     try:
-                        cloud_mgr.terminate_pod(pod_id)
-                        print("Old pod terminated successfully", file=sys.stderr)
+                        cloud_mgr.terminate_pod(backup_pod_id)
+                        loki.log_backup_pod_terminated(backup_pod_id, new_pod_id)
+                        telegram.alert_backup_pod_terminated(backup_pod_id, backup_pod_name, new_pod_id)
+                        print("Backup pod terminated successfully", file=sys.stderr)
                     except Exception as e:
-                        print(f"Warning: Failed to terminate old pod: {e}", file=sys.stderr)
+                        print(f"Warning: Failed to terminate backup pod: {e}", file=sys.stderr)
+                        telegram.alert_recreation_keeping_backup(
+                            backup_pod_id, backup_pod_name, new_pod_id,
+                            f"Termination failed: {e}"
+                        )
 
                 # Step 8: Write new pod ID to file if specified
                 if args.pod_id_file:
@@ -2414,27 +2533,29 @@ def main():
 
                 # Send success alerts
                 loki.log_pod_recreated(
-                    pod_id or "none",
+                    backup_pod_id or "none",
                     new_pod_id,
                     used_gpu.gpu_type if used_gpu else "unknown",
                     datacenter_id or "auto"
                 )
                 telegram.alert_pod_recreated(
-                    old_pod_id=pod_id or "none",
+                    old_pod_id=backup_pod_id or "none",
                     new_pod_id=new_pod_id,
-                    pod_name=pod_config.name,
+                    pod_name=original_pod_name,
                     gpu_type=used_gpu.gpu_type if used_gpu else "unknown",
                     datacenter=datacenter_id or "auto",
                     cost_per_hr=used_gpu.ondemand_price if used_gpu else 0.0
                 )
 
                 # Return results - action is 'created' if no old pod, 'recreated' if replacing
-                action = 'recreated' if pod_exists else 'created'
+                action = 'recreated' if backup_pod_id else 'created'
                 result = {
                     'success': True,
                     'action': action,
-                    'old_pod_id': pod_id if pod_exists else None,
+                    'old_pod_id': backup_pod_id if backup_pod_id else None,
+                    'backup_name': backup_pod_name,
                     'new_pod_id': new_pod_id,
+                    'pod_name': original_pod_name,
                     'original_gpu': pod_config.gpu_type_id,
                     'new_gpu': used_gpu.gpu_type,
                     'new_gpu_price': used_gpu.ondemand_price,
@@ -2452,12 +2573,12 @@ def main():
                 if args.json:
                     print(json.dumps(result, indent=2))
                 else:
-                    if pod_exists:
+                    if backup_pod_id:
                         print(f"\nPod recreated successfully!", file=sys.stderr)
-                        print(f"  Old Pod: {pod_id} (terminated)", file=sys.stderr)
+                        print(f"  Backup Pod: {backup_pod_id} ({backup_pod_name}) - terminated", file=sys.stderr)
                     else:
                         print(f"\nPod created successfully!", file=sys.stderr)
-                    print(f"  New Pod: {new_pod_id}", file=sys.stderr)
+                    print(f"  New Pod: {new_pod_id} ({original_pod_name})", file=sys.stderr)
                     print(f"  GPU: {used_gpu.gpu_type} (${used_gpu.ondemand_price}/hr)", file=sys.stderr)
                     print(f"  Public IP: {new_pod_info.public_ip}", file=sys.stderr)
 

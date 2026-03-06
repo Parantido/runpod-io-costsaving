@@ -202,12 +202,16 @@ The main command that handles all scenarios intelligently with retry logic:
 
 **What it does:**
 1. Tries to restart the existing pod
-2. If GPU unavailable, searches for similar GPUs in the same datacenter
-3. If no GPUs found, waits and retries (up to `max-retries` times)
-4. Creates a new pod with the best available GPU
-5. Terminates the old pod
-6. Updates the pod ID file
-7. Sends alerts at each step (Telegram + Loki)
+2. If restart fails (GPU unavailable on host), **renames the old pod to backup** (`{name}-backup-{timestamp}`)
+3. Searches for similar GPUs in the same datacenter
+4. If no GPUs found, waits and retries (up to `max-retries` times)
+5. Creates a new pod with the original name and best available GPU
+6. **Terminates the backup pod** (safe cleanup after new pod is running)
+7. Updates the pod ID file
+8. Sends alerts at each step (Telegram + Loki)
+
+**Why the backup approach?**
+Creating a completely new pod (vs restarting the existing one) allows RunPod to place it on **any available host** in the datacenter, greatly improving GPU availability. The old pod is renamed rather than terminated first to preserve it as a rollback option until the new pod is confirmed running.
 
 #### clone-pod
 
