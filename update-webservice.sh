@@ -6,16 +6,59 @@ source "${SCRIPT_DIR}/config.sh"
 # Create log directory if it doesn't exist
 mkdir -p "$LOG_DIR"
 
-# Logging function
+# ============================================================
+# Logging
+# ============================================================
 log() {
     local level="$1"
     shift
     local message="$*"
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     echo "[$timestamp] [$level] [update-ws] $message" | tee -a "$LOG_FILE"
 }
 
-# Email notification function
+# ============================================================
+# Telegram notification
+# ============================================================
+send_telegram() {
+    local level="$1"   # SUCCESS | ERROR | INFO | WARNING
+    local message="$2"
+
+    if [ "$_TELEGRAM_ENABLED" != "true" ]; then
+        return 0
+    fi
+    if [ -z "$_TELEGRAM_TOKEN" ] || [ -z "$_TELEGRAM_CHAT_ID" ]; then
+        log "WARN" "Telegram token or chat ID not set, skipping notification"
+        return 1
+    fi
+
+    local icon
+    case "$level" in
+        SUCCESS) icon="✅" ;;
+        ERROR)   icon="🚨" ;;
+        WARNING) icon="⚠️"  ;;
+        *)       icon="ℹ️"  ;;
+    esac
+
+    local full_message="${icon} *${level}*
+${message}"
+
+    curl -s -X POST \
+        "https://api.telegram.org/bot${_TELEGRAM_TOKEN}/sendMessage" \
+        -H "Content-Type: application/json" \
+        -d "$(jq -n \
+            --arg chat_id "$_TELEGRAM_CHAT_ID" \
+            --arg text "$full_message" \
+            '{chat_id: $chat_id, text: $text, parse_mode: "Markdown"}')" \
+        >/dev/null 2>&1
+
+    return $?
+}
+
+# ============================================================
+# Email notification
+# ============================================================
 send_email() {
     local subject="$1"
     local body="$2"
@@ -26,7 +69,6 @@ send_email() {
     fi
 }
 
-# Debug email notification (only sends if DEBUGGING=true)
 send_debug_email() {
     local subject="$1"
     local body="$2"
@@ -35,78 +77,365 @@ send_debug_email() {
     fi
 }
 
-# Get stored pod ID (returns empty if file doesn't exist)
-get_stored_pod_id() {
-    if [ -f "$POD_ID_FILE" ]; then
-        cat "$POD_ID_FILE"
-    fi
+# ============================================================
+# Usage
+# ============================================================
+usage() {
+    cat <<EOF
+Usage: $0 [OPTIONS]
+
+Update a remote webservice with the current RunPod instance endpoint.
+
+Options:
+  --pod-id-file FILE       Path to file containing pod ID
+                           (default: \$POD_ID_FILE from config.sh)
+  --gpu-machine-id ID      GPU machine ID sent to webservice API
+                           (default: \$GPU_MACHINE_ID from config.sh)
+  --api-url URL            Webservice API URL
+                           (default: \$API_URL from config.sh)
+  --telegram-token TOKEN   Telegram bot token
+                           (default: \$TELEGRAM_BOT_TOKEN from config.sh)
+  --telegram-chat-id ID    Telegram chat ID
+                           (default: \$TELEGRAM_CHAT_ID from config.sh)
+  --no-telegram            Disable Telegram notifications
+  --update-transcserver    Update TRANSCSERVER override for VM method (instead of GPU machine)
+  --method METHOD           VM method for TRANSCSERVER update
+                           Valid methods: captcha, mailboxfull-captcha, mailboxfull-diversion,
+                           diversion, s2s-tmobile, s2s-att
+  --transcserver-value VAL  TRANSCSERVER value (host:port format, e.g., 192.168.1.50:50051)
+                           If not provided, will be retrieved from RunPod instance
+  -h, --help               Show this help message
+
+Examples:
+  # Single instance (uses config.sh defaults) - GPU machine update
+  $0
+
+  # Instance 1 - GPU machine update
+  $0 --pod-id-file /root/mgmt/runpod/logs/tr-gpu-01-prod.pod_id --gpu-machine-id 3
+
+  # Instance 2 - GPU machine update
+  $0 --pod-id-file /root/mgmt/runpod/logs/tr-gpu-02-prod.pod_id --gpu-machine-id 4
+
+  # TRANSCSERVER update for diversion method (value fetched from pod automatically)
+  $0 --update-transcserver --method diversion --pod-id-file /root/mgmt/runpod/logs/current_pod_id
+
+  # TRANSCSERVER update for s2s-tmobile method (value fetched from pod automatically)
+  $0 --update-transcserver --method s2s-tmobile
+
+  # TRANSCSERVER update with manual value override
+  $0 --update-transcserver --method s2s-tmobile --transcserver-value "192.168.1.50:50051"
+
+EOF
+    exit 0
 }
 
-# Get the pod ID - either from argument or from stored file
-POD_ID=$1
+# ============================================================
+# Argument parsing
+# ============================================================
+_POD_ID_FILE="$POD_ID_FILE"
+_GPU_MACHINE_ID="$GPU_MACHINE_ID"
+_API_URL="$API_URL"
+_TELEGRAM_TOKEN="$TELEGRAM_BOT_TOKEN"
+_TELEGRAM_CHAT_ID="$TELEGRAM_CHAT_ID"
+_TELEGRAM_ENABLED="${TELEGRAM_ENABLED:-true}"
+_UPDATE_TRANSCSERVER="${UPDATE_TRANSCSERVER:-false}"
+_METHOD=""
+_TRANSCSERVER_VALUE=""
 
-if [ -z "$POD_ID" ]; then
-    # Try to get from stored file
-    POD_ID=$(get_stored_pod_id)
-    if [ -z "$POD_ID" ]; then
-        log "ERROR" "You must specify a pod id or have one stored!"
-        echo "Usage: $0 [pod_id]"
-        echo "No pod ID specified and none stored in $POD_ID_FILE"
-        exit 1
-    fi
-    log "INFO" "Using stored pod ID: $POD_ID"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --pod-id-file)       _POD_ID_FILE="$2"; shift 2 ;;
+        --gpu-machine-id)     _GPU_MACHINE_ID="$2"; shift 2 ;;
+        --api-url)            _API_URL="$2"; shift 2 ;;
+        --telegram-token)       _TELEGRAM_TOKEN="$2"; shift 2 ;;
+        --telegram-chat-id)     _TELEGRAM_CHAT_ID="$2"; shift 2 ;;
+        --no-telegram)         _TELEGRAM_ENABLED="false"; shift ;;
+        --update-transcserver) _UPDATE_TRANSCSERVER="true"; shift ;;
+        --method)              _METHOD="$2"; shift 2 ;;
+        --transcserver-value)  _TRANSCSERVER_VALUE="$2"; shift 2 ;;
+        -h|--help)            usage ;;
+        *)
+            # Legacy positional: first arg may be pod_id (backward compat)
+            if [ -z "$_LEGACY_POD_ID" ]; then
+                _LEGACY_POD_ID="$1"
+            else
+                echo "Unknown argument: $1" >&2
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+# ============================================================
+# Validate arguments and resolve common values
+# ============================================================
+
+# Resolve pod ID (needed for both TRANSCSERVER and GPU machine modes)
+if [ -n "$_LEGACY_POD_ID" ]; then
+    POD_ID="$_LEGACY_POD_ID"
+    log "INFO" "Using pod ID from argument: $POD_ID"
+elif [ -f "$_POD_ID_FILE" ]; then
+    POD_ID=$(cat "$_POD_ID_FILE")
+    log "INFO" "Using stored pod ID from ${_POD_ID_FILE}: $POD_ID"
+else
+    POD_ID=""
 fi
 
-log "INFO" "Fetching pod $POD_ID information..."
+# Fetch pod info if TRANSCSERVER_VALUE is not provided (for both modes)
+if [ -z "$_TRANSCSERVER_VALUE" ] && [ -n "$POD_ID" ]; then
+    if [ -z "$POD_ID" ]; then
+        log "ERROR" "No pod ID specified and pod ID file not found: ${_POD_ID_FILE}"
+        send_telegram "ERROR" "update-webservice failed: no pod ID specified and file not found: \`${_POD_ID_FILE}\`"
+        send_email "RunPod Update Webservice Failed" "No pod ID specified and none stored in ${_POD_ID_FILE}"
+        exit 1
+    fi
 
-# Get pod info
+    if [ -z "$POD_ID" ]; then
+        log "ERROR" "Pod ID file exists but is empty: ${_POD_ID_FILE}"
+        send_telegram "ERROR" "update-webservice failed: pod ID file is empty: \`${_POD_ID_FILE}\`"
+        send_email "RunPod Update Webservice Failed" "Pod ID file is empty: ${_POD_ID_FILE}"
+        exit 1
+    fi
+
+    # Fetch pod info
+    log "INFO" "Fetching pod ${POD_ID} information..."
+
+    POD_INFO=$("${SCRIPT_DIR}/runpod_costsaving.py" --json info "$POD_ID" 2>&1)
+    INFO_EXIT_CODE=$?
+
+    if [ $INFO_EXIT_CODE -ne 0 ]; then
+        log "ERROR" "Failed to get pod info: $POD_INFO"
+        send_telegram "ERROR" "update-webservice failed to get info for pod \`${POD_ID}\` (machine ID: ${_GPU_MACHINE_ID})$'\n\n'Error: ${POD_INFO}"
+        send_email "RunPod Update Webservice Failed" "Failed to get pod $POD_ID information.\n\nError: $POD_INFO"
+        exit 1
+    fi
+
+    # Extract IP, port, status
+    PUBLIC_IP=$(echo "$POD_INFO"  | jq -r '.public_ip // empty' 2>/dev/null)
+    PORT_50051=$(echo "$POD_INFO" | jq -r '.port_mappings[] | select(.container_port==50051 and .protocol=="tcp") | .public_port // empty' 2>/dev/null)
+    POD_STATUS=$(echo "$POD_INFO" | jq -r '.status // empty' 2>/dev/null)
+    POD_NAME=$(echo "$POD_INFO"   | jq -r '.name // empty' 2>/dev/null)
+
+    log "INFO" "Pod name:   $POD_NAME"
+    log "INFO" "Pod status: $POD_STATUS"
+    log "INFO" "Public IP:  $PUBLIC_IP"
+    log "INFO" "Port 50051: $PORT_50051"
+
+    # Check pod is running
+    if [ "$POD_STATUS" != "RUNNING" ]; then
+        log "ERROR" "Pod is not running (status: $POD_STATUS)"
+        send_telegram "ERROR" "update-webservice: pod \`${POD_ID}\` (${POD_NAME}) is not RUNNING$'\n\n'Status: ${POD_STATUS}$'\n'Machine ID: ${_GPU_MACHINE_ID}"
+        send_email "RunPod Update Webservice Failed" "Pod $POD_ID is not running.\n\nStatus: $POD_STATUS\n\nCannot update webservice."
+        exit 1
+    fi
+
+    # Check IP and port
+    if [ -z "$PUBLIC_IP" ] || [ -z "$PORT_50051" ] || [ "$PUBLIC_IP" = "null" ] || [ "$PORT_50051" = "null" ]; then
+        log "ERROR" "Pod is running but IP or port 50051 not available"
+        log "ERROR" "Pod info: $POD_INFO"
+        send_telegram "ERROR" "update-webservice: pod \`${POD_ID}\` (${POD_NAME}) is RUNNING but port 50051 is not exposed yet$'\n\n'Machine ID: ${_GPU_MACHINE_ID}"
+        send_email "RunPod Update Webservice Failed" "Pod $POD_ID is running but port 50051 is not exposed.\n\nPod Info: $POD_INFO"
+        exit 1
+    fi
+
+    log "INFO" "Found endpoint: $PUBLIC_IP:$PORT_50051"
+    # Set TRANSCSERVER_VALUE or GPU_MACHINE_IP based on mode
+    if [ "$_UPDATE_TRANSCSERVER" = "true" ]; then
+        _TRANSCSERVER_VALUE="${PUBLIC_IP}:${PORT_50051}"
+        log "INFO" "TRANSCSERVER value from pod: $_TRANSCSERVER_VALUE"
+    else
+        GPU_MACHINE_IP="${PUBLIC_IP}:${PORT_50051}"
+    fi
+fi
+
+# ============================================================
+# Validate TRANSCSERVER mode
+# ============================================================
+if [ "$_UPDATE_TRANSCSERVER" = "true" ]; then
+    if [ -z "$_METHOD" ]; then
+        log "ERROR" "--update-transcserver requires --method"
+        usage
+        exit 1
+    fi
+
+    # TRANSCSERVER_VALUE is now set either from argument or from pod info
+    if [ -z "$_TRANSCSERVER_VALUE" ]; then
+        log "ERROR" "--update-transcserver requires --transcserver-value or --pod-id-file to fetch value from pod"
+        usage
+        exit 1
+    fi
+
+    VALID_METHODS=("captcha" "mailboxfull-captcha" "mailboxfull-diversion" "diversion" "s2s-tmobile" "s2s-att")
+    if [[ ! " ${VALID_METHODS[@]} " =~ " ${_METHOD} " ]]; then
+        log "ERROR" "Invalid method: $_METHOD. Valid methods: ${VALID_METHODS[*]}"
+        usage
+        exit 1
+    fi
+
+    log "INFO" "TRANSCSERVER update mode: method=$_METHOD, value=$_TRANSCSERVER_VALUE"
+fi
+
+# ============================================================
+# Update remote webservice
+# ============================================================
+if [ "$_UPDATE_TRANSCSERVER" = "true" ]; then
+    # TRANSCSERVER update mode
+    log "INFO" "Updating TRANSCSERVER for method=$_METHOD at ${_API_URL}/api/settings/transcserver/$_METHOD..."
+    PAYLOAD=$(jq -n --arg value "$_TRANSCSERVER_VALUE" '{value: $value}')
+    
+    log "INFO" "Payload: $PAYLOAD"
+    
+    HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${_API_URL}/api/settings/transcserver/$_METHOD" \
+        -H "Content-Type: application/json" \
+        -d "$PAYLOAD")
+    
+    HTTP_BODY=$(echo "$HTTP_RESPONSE" | head -n -1)
+    HTTP_CODE=$(echo "$HTTP_RESPONSE" | tail -n -1)
+    
+    log "INFO" "API Response Code: $HTTP_CODE"
+    log "INFO" "API Response Body: $HTTP_BODY"
+    
+    if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+        log "INFO" "Successfully updated TRANSCSERVER for method=$_METHOD"
+        send_telegram "SUCCESS" "TRANSCSERVER updated$'\n\n'Method: \`${_METHOD}\`$'\n'Value: \`${_TRANSCSERVER_VALUE}\`"
+        send_debug_email "TRANSCSERVER Updated" "TRANSCSERVER updated successfully!\n\nMethod: $_METHOD\nValue: $_TRANSCSERVER_VALUE\nAPI Response: $HTTP_CODE"
+        echo "TRANSCSERVER updated successfully. Method: $_METHOD, Value: $_TRANSCSERVER_VALUE"
+        exit 0
+    else
+        log "ERROR" "Failed to update TRANSCSERVER. HTTP Code: $HTTP_CODE, Response: $HTTP_BODY"
+        send_telegram "ERROR" "TRANSCSERVER update failed$'\n\n'Method: \`${_METHOD}\`$'\n'Value: \`${_TRANSCSERVER_VALUE}\`$'\n'HTTP Code: ${HTTP_CODE}$'\n'Response: $HTTP_BODY"
+        send_email "TRANSCSERVER Update Failed" "Failed to update TRANSCSERVER for method $_METHOD.\n\nValue: $_TRANSCSERVER_VALUE\nHTTP Code: $HTTP_CODE\nResponse: $HTTP_BODY"
+        exit 1
+    fi
+else
+    # GPU machine update mode (existing logic)
+    PAYLOAD=$(jq -n \
+        --arg token "$VALIDATION_TOKEN" \
+        --arg machineId "$_GPU_MACHINE_ID" \
+        --arg machineIp "$GPU_MACHINE_IP" \
+        '{ValidationToken: $token, GPUMachineId: $machineId, GPUMachineIp: $machineIp}')
+    
+    log "INFO" "Updating webservice at ${_API_URL}..."
+    log "INFO" "Payload: $PAYLOAD"
+    
+    HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$_API_URL" \
+        -H "Content-Type: application/json" \
+        -d "$PAYLOAD")
+    
+    HTTP_BODY=$(echo "$HTTP_RESPONSE" | head -n -1)
+    HTTP_CODE=$(echo "$HTTP_RESPONSE" | tail -n -1)
+    
+    log "INFO" "API Response Code: $HTTP_CODE"
+    log "INFO" "API Response Body: $HTTP_BODY"
+    
+    if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+        log "INFO" "Successfully updated webservice with pod information"
+        send_telegram "SUCCESS" "Webservice updated$'\n\n'Pod: \`${POD_ID}\` (${POD_NAME})$'\n'Machine ID: ${_GPU_MACHINE_ID}$'\n'Endpoint: \`${GPU_MACHINE_IP}\`"
+        send_debug_email "RunPod Webservice Updated" "Webservice updated successfully!\n\nPod ID: $POD_ID\nName: $POD_NAME\nEndpoint: $GPU_MACHINE_IP\nMachine ID: ${_GPU_MACHINE_ID}\nAPI Response: $HTTP_CODE"
+        echo "Webservice updated successfully. Endpoint: $GPU_MACHINE_IP"
+    else
+        log "ERROR" "Failed to update webservice. HTTP Code: $HTTP_CODE, Response: $HTTP_BODY"
+        send_telegram "ERROR" "Webservice update failed$'\n\n'Pod: \`${POD_ID}\` (${POD_NAME})$'\n'Machine ID: ${_GPU_MACHINE_ID}$'\n'Endpoint: \`${GPU_MACHINE_IP}\`$'\n'HTTP Code: ${HTTP_CODE}$'\n'Response: $HTTP_BODY"
+        send_email "RunPod Webservice Update Failed" "Failed to update webservice for pod $POD_ID.\n\nEndpoint: $GPU_MACHINE_IP\nHTTP Code: $HTTP_CODE\nResponse: $HTTP_BODY"
+        exit 1
+    fi
+fi
+
+# ============================================================
+# Logging
+# ============================================================
+log() {
+    local level="$1"
+    shift
+    local message="$*"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [$level] [update-ws] $message" | tee -a "$LOG_FILE"
+}
+
+# ============================================================
+# Resolve pod ID
+# ============================================================
+if [ -n "$_LEGACY_POD_ID" ]; then
+    POD_ID="$_LEGACY_POD_ID"
+    log "INFO" "Using pod ID from argument: $POD_ID"
+elif [ -f "$_POD_ID_FILE" ]; then
+    POD_ID=$(cat "$_POD_ID_FILE")
+    log "INFO" "Using stored pod ID from ${_POD_ID_FILE}: $POD_ID"
+else
+    log "ERROR" "No pod ID specified and pod ID file not found: ${_POD_ID_FILE}"
+    send_telegram "ERROR" "update-webservice failed: no pod ID specified and file not found: \`${_POD_ID_FILE}\`"
+    send_email "RunPod Update Webservice Failed" "No pod ID specified and none stored in ${_POD_ID_FILE}"
+    exit 1
+fi
+
+if [ -z "$POD_ID" ]; then
+    log "ERROR" "Pod ID file exists but is empty: ${_POD_ID_FILE}"
+    send_telegram "ERROR" "update-webservice failed: pod ID file is empty: \`${_POD_ID_FILE}\`"
+    send_email "RunPod Update Webservice Failed" "Pod ID file is empty: ${_POD_ID_FILE}"
+    exit 1
+fi
+
+# ============================================================
+# Fetch pod info
+# ============================================================
+log "INFO" "Fetching pod ${POD_ID} information..."
+
 POD_INFO=$("${SCRIPT_DIR}/runpod_costsaving.py" --json info "$POD_ID" 2>&1)
 INFO_EXIT_CODE=$?
 
 if [ $INFO_EXIT_CODE -ne 0 ]; then
     log "ERROR" "Failed to get pod info: $POD_INFO"
+    send_telegram "ERROR" "update-webservice failed to get info for pod \`${POD_ID}\` (machine ID: ${_GPU_MACHINE_ID})$'\n\n'Error: ${POD_INFO}"
     send_email "RunPod Update Webservice Failed" "Failed to get pod $POD_ID information.\n\nError: $POD_INFO"
     exit 1
 fi
 
-# Extract IP and port
-PUBLIC_IP=$(echo "$POD_INFO" | jq -r '.public_ip // empty' 2>/dev/null)
+# Extract IP, port, status
+PUBLIC_IP=$(echo "$POD_INFO"  | jq -r '.public_ip // empty' 2>/dev/null)
 PORT_50051=$(echo "$POD_INFO" | jq -r '.port_mappings[] | select(.container_port==50051 and .protocol=="tcp") | .public_port // empty' 2>/dev/null)
 POD_STATUS=$(echo "$POD_INFO" | jq -r '.status // empty' 2>/dev/null)
+POD_NAME=$(echo "$POD_INFO"   | jq -r '.name // empty' 2>/dev/null)
 
+log "INFO" "Pod name:   $POD_NAME"
 log "INFO" "Pod status: $POD_STATUS"
-log "INFO" "Public IP: $PUBLIC_IP"
-log "INFO" "Port 50051 mapping: $PORT_50051"
+log "INFO" "Public IP:  $PUBLIC_IP"
+log "INFO" "Port 50051: $PORT_50051"
 
-# Check if pod is running
+# Check pod is running
 if [ "$POD_STATUS" != "RUNNING" ]; then
     log "ERROR" "Pod is not running (status: $POD_STATUS)"
+    send_telegram "ERROR" "update-webservice: pod \`${POD_ID}\` (${POD_NAME}) is not RUNNING$'\n\n'Status: ${POD_STATUS}$'\n'Machine ID: ${_GPU_MACHINE_ID}"
     send_email "RunPod Update Webservice Failed" "Pod $POD_ID is not running.\n\nStatus: $POD_STATUS\n\nCannot update webservice."
     exit 1
 fi
 
-# Check if we have IP and port
-if [ -z "$PUBLIC_IP" ] || [ -z "$PORT_50051" ] || [ "$PUBLIC_IP" == "null" ] || [ "$PORT_50051" == "null" ]; then
+# Check IP and port
+if [ -z "$PUBLIC_IP" ] || [ -z "$PORT_50051" ] || [ "$PUBLIC_IP" = "null" ] || [ "$PORT_50051" = "null" ]; then
     log "ERROR" "Pod is running but IP or port 50051 not available"
     log "ERROR" "Pod info: $POD_INFO"
+    send_telegram "ERROR" "update-webservice: pod \`${POD_ID}\` (${POD_NAME}) is RUNNING but port 50051 is not exposed yet$'\n\n'Machine ID: ${_GPU_MACHINE_ID}"
     send_email "RunPod Update Webservice Failed" "Pod $POD_ID is running but port 50051 is not exposed.\n\nPod Info: $POD_INFO"
     exit 1
 fi
 
 log "INFO" "Found endpoint: $PUBLIC_IP:$PORT_50051"
 
-# Update the remote webservice
+# ============================================================
+# Update remote webservice
+# ============================================================
 GPU_MACHINE_IP="${PUBLIC_IP}:${PORT_50051}"
 PAYLOAD=$(jq -n \
     --arg token "$VALIDATION_TOKEN" \
-    --arg machineId "$GPU_MACHINE_ID" \
+    --arg machineId "$_GPU_MACHINE_ID" \
     --arg machineIp "$GPU_MACHINE_IP" \
     '{ValidationToken: $token, GPUMachineId: $machineId, GPUMachineIp: $machineIp}')
 
-log "INFO" "Updating webservice at $API_URL..."
+log "INFO" "Updating webservice at ${_API_URL}..."
 log "INFO" "Payload: $PAYLOAD"
 
-HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$API_URL" \
+HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$_API_URL" \
     -H "Content-Type: application/json" \
     -d "$PAYLOAD")
 
@@ -118,10 +447,12 @@ log "INFO" "API Response Body: $HTTP_BODY"
 
 if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
     log "INFO" "Successfully updated webservice with pod information"
-    send_debug_email "RunPod Webservice Updated" "Webservice updated successfully!\n\nPod ID: $POD_ID\nEndpoint: $GPU_MACHINE_IP\nAPI Response: $HTTP_CODE"
+    send_telegram "SUCCESS" "Webservice updated$'\n\n'Pod: \`${POD_ID}\` (${POD_NAME})$'\n'Machine ID: ${_GPU_MACHINE_ID}$'\n'Endpoint: \`${GPU_MACHINE_IP}\`"
+    send_debug_email "RunPod Webservice Updated" "Webservice updated successfully!\n\nPod ID: $POD_ID\nName: $POD_NAME\nEndpoint: $GPU_MACHINE_IP\nMachine ID: ${_GPU_MACHINE_ID}\nAPI Response: $HTTP_CODE"
     echo "Webservice updated successfully. Endpoint: $GPU_MACHINE_IP"
 else
     log "ERROR" "Failed to update webservice. HTTP Code: $HTTP_CODE, Response: $HTTP_BODY"
+    send_telegram "ERROR" "Webservice update failed$'\n\n'Pod: \`${POD_ID}\` (${POD_NAME})$'\n'Machine ID: ${_GPU_MACHINE_ID}$'\n'Endpoint: \`${GPU_MACHINE_IP}\`$'\n'HTTP Code: ${HTTP_CODE}$'\n'Response: ${HTTP_BODY}"
     send_email "RunPod Webservice Update Failed" "Failed to update webservice for pod $POD_ID.\n\nEndpoint: $GPU_MACHINE_IP\nHTTP Code: $HTTP_CODE\nResponse: $HTTP_BODY"
     exit 1
 fi

@@ -569,18 +569,20 @@ echo "Test email body" | mail -s "[TEST] RunPod Alert" your-email@example.com
 ```
 /root/mgmt/runpod/
 ├── runpod_costsaving.py    # Main Python CLI tool
-├── config.sh               # Configuration file
+├── config.sh               # Configuration file (shared defaults)
 ├── config.sh.tpl           # Configuration template
-├── start.sh                # Pod start orchestration
-├── stop.sh                 # Pod stop script
+├── start.sh                # Pod start orchestration (legacy single-instance)
+├── stop.sh                 # Pod stop script (legacy single-instance)
 ├── info.sh                 # Pod info script
-├── update-webservice.sh    # External service update
+├── update-webservice.sh    # External service update (multi-instance capable)
 ├── test_alerts.sh          # Alert testing tool
 ├── dry_run_restart.py      # Restart simulation tool
 ├── .apiKey                 # RunPod API key (DO NOT COMMIT)
 ├── logs/
-│   ├── runpod.log          # Activity log
-│   └── current_pod_id      # Current active pod ID
+│   ├── runpod.log              # Activity log
+│   ├── current_pod_id          # Legacy single-instance pod ID file
+│   ├── tr-gpu-01-prod.pod_id   # Pod ID for instance 1 (multi-instance)
+│   └── tr-gpu-02-prod.pod_id   # Pod ID for instance 2 (multi-instance)
 └── README.md               # This file
 ```
 
@@ -707,35 +709,88 @@ Log format:
 
 ## Automation
 
-### Cron job for automatic restart
+### Multi-Instance Cron Setup
 
-Add to crontab to automatically start pods:
+Each pod instance is identified by its own pod ID file (`--pod-id-file`). This allows multiple
+independent pods to be managed from the same host without conflict.
 
-```bash
-# Start pod every day at 8 AM
-0 8 * * * /root/mgmt/runpod/start.sh >> /root/mgmt/runpod/logs/cron.log 2>&1
-
-# Stop pod every day at 10 PM
-0 22 * * * /root/mgmt/runpod/stop.sh >> /root/mgmt/runpod/logs/cron.log 2>&1
+**File layout** (one file per instance):
+```
+logs/
+├── tr-gpu-01-prod.pod_id   # pod ID for instance 1
+├── tr-gpu-02-prod.pod_id   # pod ID for instance 2
+└── runpod.log
 ```
 
-### Using restart-or-recreate in cron
+**Example crontab** (edit with `crontab -e`):
 
-For more control with alerting and retry:
-
-```bash
-# With full options
-30 15 * * * /root/mgmt/runpod/runpod_costsaving.py restart-or-recreate \
+```cron
+# ── Instance 1: tr-gpu-01-prod ────────────────────────────────────────────────
+# Start
+30 15 * * 1-5 /root/mgmt/runpod/runpod_costsaving.py restart-or-recreate \
+  --pod-id-file /root/mgmt/runpod/logs/tr-gpu-01-prod.pod_id \
   --fallback-template-id 02rh6eeawc \
   --fallback-network-volume-id y4aw9smcev \
-  --fallback-image-name "docker.io/user/image:tag" \
+  --fallback-image-name "docker.io/parantido/riva-speech-runpod:2.19.0" \
   --fallback-gpu "NVIDIA H200" \
-  --fallback-name "my-pod" \
-  --max-price 5.00 \
-  --max-retries 3 \
-  --retry-interval 300 \
-  --json >> /root/mgmt/runpod/logs/cron.log 2>&1
+  --fallback-name "tr-gpu-01-prod" \
+  --max-price 5.00 --json >> /root/mgmt/runpod/logs/cron.log 2>&1
+
+# Update webservice
+55 15 * * 1-5 /root/mgmt/runpod/update-webservice.sh \
+  --pod-id-file /root/mgmt/runpod/logs/tr-gpu-01-prod.pod_id \
+  --gpu-machine-id 3 >> /root/mgmt/runpod/logs/cron.log 2>&1
+
+# Stop
+20 23 * * * /root/mgmt/runpod/runpod_costsaving.py --json --pod-id-file /root/mgmt/runpod/logs/tr-gpu-01-prod.pod_id stop >> /root/mgmt/runpod/logs/cron.log 2>&1
+
+# ── Instance 2: tr-gpu-02-prod ────────────────────────────────────────────────
+# Start
+30 15 * * 1-5 /root/mgmt/runpod/runpod_costsaving.py restart-or-recreate \
+  --pod-id-file /root/mgmt/runpod/logs/tr-gpu-02-prod.pod_id \
+  --fallback-template-id 02rh6eeawc \
+  --fallback-network-volume-id y4aw9smcev \
+  --fallback-image-name "docker.io/parantido/riva-speech-runpod:2.19.0" \
+  --fallback-gpu "NVIDIA H200" \
+  --fallback-name "tr-gpu-02-prod" \
+  --max-price 9.00 --json >> /root/mgmt/runpod/logs/cron.log 2>&1
+
+# Update webservice
+55 15 * * 1-5 /root/mgmt/runpod/update-webservice.sh \
+  --pod-id-file /root/mgmt/runpod/logs/tr-gpu-02-prod.pod_id \
+  --gpu-machine-id 4 >> /root/mgmt/runpod/logs/cron.log 2>&1
+
+# Stop
+20 23 * * * /root/mgmt/runpod/runpod_costsaving.py --json --pod-id-file /root/mgmt/runpod/logs/tr-gpu-02-prod.pod_id stop >> /root/mgmt/runpod/logs/cron.log 2>&1
 ```
+
+> **Note on `stop`**: the legacy `stop` action accepts `--pod-id-file` *before* the action verb
+> because it is parsed in legacy mode. The pattern is:
+> `runpod_costsaving.py [--json] [--pod-id-file FILE] stop`
+
+### File Structure for Multiple Instances
+
+```
+logs/
+├── tr-gpu-01-prod.pod_id   # Written by restart-or-recreate for instance 1
+├── tr-gpu-02-prod.pod_id   # Written by restart-or-recreate for instance 2
+└── runpod.log
+```
+
+`restart-or-recreate` automatically writes the new pod ID to `--pod-id-file` after a successful
+start or recreation, so the subsequent `update-webservice.sh` and `stop` calls will always use
+the correct current pod ID.
+
+### update-webservice.sh options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--pod-id-file FILE` | Path to file containing the pod ID | `$POD_ID_FILE` from config.sh |
+| `--gpu-machine-id ID` | GPU machine ID sent to the API | `$GPU_MACHINE_ID` from config.sh |
+| `--api-url URL` | Webservice API URL | `$API_URL` from config.sh |
+| `--telegram-token TOKEN` | Override Telegram bot token | from config.sh |
+| `--telegram-chat-id ID` | Override Telegram chat ID | from config.sh |
+| `--no-telegram` | Disable Telegram notifications | `false` |
 
 ### Systemd service
 
