@@ -358,6 +358,18 @@ class TelegramNotifier:
             f"Manual cleanup may be required."
         )
         return self.send_alert(message, "WARNING")
+    
+    def alert_retry_without_network_volume(self, network_volume_id: str, datacenter: str) -> bool:
+        """Alert when retrying pod creation without network volume after all attempts failed"""
+        datacenter_note = f"Datacenter: `{datacenter}`" if datacenter and datacenter != "unknown" else "Datacenter: auto-detected from volume (now removed)"
+        message = (
+            f"*Retrying without network volume*\n"
+            f"All attempts with network volume failed.\n\n"
+            f"Network Volume: `{network_volume_id}`\n"
+            f"{datacenter_note}\n\n"
+            f"Now searching all datacenters without network volume constraint."
+        )
+        return self.send_alert(message, "WARNING")
 
 
 class LokiLogger:
@@ -573,9 +585,21 @@ class RunPodManager:
             raise Exception(f"Command failed: {e.stderr}")
     
     def get_pod_info(self) -> PodInfo:
-        """Get detailed pod information"""
-        output = self._run_command(['runpodctl', 'get', 'pod', self.pod_id, '-a'])
-        return self._parse_pod_output(output)
+        """Get detailed pod information.
+
+        Primary: GraphQL runtime.ports — the only source that returns public IP/port
+        mappings reliably regardless of CLI version.
+
+        Fallback: old runpodctl v1 table format (get pod <id> -a). The new runpodctl
+        v2 (pod get <id>) returns JSON but omits public IP/port mappings entirely, so
+        it cannot be used as a fallback for port resolution.
+        """
+        try:
+            return CloudManager().get_pod_info_graphql(self.pod_id)
+        except Exception as e:
+            debug_log("WARN", f"GraphQL pod info failed, falling back to runpodctl v1: {e}")
+            output = self._run_command(['runpodctl', 'get', 'pod', self.pod_id, '-a'])
+            return self._parse_pod_output(output)
     
     def _parse_pod_output(self, output: str) -> PodInfo:
         """Parse runpodctl output to extract pod information"""
@@ -977,6 +1001,66 @@ class CloudManager:
             env=pod.get('env', []),
             docker_args=pod.get('dockerArgs'),
             cost_per_hr=pod.get('costPerHr')
+        )
+
+    def get_pod_info_graphql(self, pod_id: str) -> 'PodInfo':
+        """Get runtime pod info (status + public port mappings) via GraphQL.
+
+        Uses the runtime.ports field which is always fully populated regardless
+        of whether stdout is a TTY — unlike 'runpodctl get pod -a' which truncates
+        the PORTS column when not connected to a terminal.
+        """
+        query = '''
+        query getPodInfo($input: PodFilter) {
+            pod(input: $input) {
+                id
+                name
+                desiredStatus
+                runtime {
+                    ports {
+                        ip
+                        isIpPublic
+                        privatePort
+                        publicPort
+                        type
+                    }
+                }
+            }
+        }
+        '''
+        variables = {"input": {"podId": pod_id}}
+        result = self._graphql_query(query, variables, "getPodInfo")
+
+        pod = result.get('data', {}).get('pod')
+        if not pod:
+            raise Exception(f"Pod {pod_id} not found via GraphQL")
+
+        # desiredStatus values: RUNNING, EXITED, etc.
+        status = pod.get('desiredStatus', 'UNKNOWN')
+
+        runtime = pod.get('runtime') or {}
+        raw_ports = runtime.get('ports') or []
+
+        port_mappings = []
+        for p in raw_ports:
+            if not p.get('isIpPublic'):
+                continue
+            port_mappings.append(PortMapping(
+                public_ip=p['ip'],
+                public_port=int(p['publicPort']),
+                container_port=int(p['privatePort']),
+                protocol=p.get('type', 'tcp').lower(),
+                visibility='pub',
+            ))
+
+        public_ip = port_mappings[0].public_ip if port_mappings else None
+
+        return PodInfo(
+            id=pod.get('id', pod_id),
+            name=pod.get('name', ''),
+            status=status,
+            public_ip=public_ip,
+            port_mappings=port_mappings,
         )
 
     def get_available_gpus_for_datacenter(self, datacenter_id: str, min_mem: int = 8, min_vcpu: int = 2) -> List[CloudGPU]:
@@ -1847,6 +1931,8 @@ def main():
             help='Maximum number of retry attempts when no GPU available (default: 3)')
         restart_parser.add_argument('--retry-interval', type=int, default=300,
             help='Seconds to wait between retry attempts (default: 300 = 5 minutes)')
+        restart_parser.add_argument('--try-without-network-volume', action='store_true', default=True,
+            help='If recreation fails with network volume, try again without it (default: True)')
         # Telegram alerting configuration
         restart_parser.add_argument('--telegram-token', help='Telegram bot token (overrides config)')
         restart_parser.add_argument('--telegram-chat-id', help='Telegram chat ID (overrides config)')
@@ -2321,6 +2407,7 @@ def main():
                 new_pod_id = None
                 used_gpu = None
                 final_errors = []
+                try_without_nv = False
                 
                 for retry_attempt in range(1, max_retries + 1):
                     loki.log_gpu_search(datacenter_id or "any", pod_config.gpu_type_id, retry_attempt)
@@ -2355,7 +2442,14 @@ def main():
                             time.sleep(retry_interval)
                             continue
                         else:
-                            # Final attempt failed - send critical alert
+                            # Final attempt failed - check if we should try without network volume
+                            # Note: even if datacenter_id is None, create_pod_graphql auto-detects
+                            # the datacenter from network_volume_id, so removing it is still meaningful
+                            if pod_config.network_volume_id and getattr(args, 'try_without_network_volume', True):
+                                print(f"No GPUs available with network volume constraint. Will retry without network volume...", file=sys.stderr)
+                                try_without_nv = True
+                                break
+                            # Otherwise, send critical alert and exit
                             total_time_minutes = int((time.time() - retry_start_time) / 60)
                             telegram.alert_no_gpu_final(
                                 datacenter=datacenter_id or "any",
@@ -2436,7 +2530,14 @@ def main():
                         )
                         time.sleep(retry_interval)
                     else:
-                        # Final attempt - all GPUs failed
+                        # Final attempt - all GPUs failed, check if we should try without network volume
+                        # Note: even if datacenter_id is None, create_pod_graphql auto-detects
+                        # the datacenter from network_volume_id, so removing it is still meaningful
+                        if pod_config.network_volume_id and getattr(args, 'try_without_network_volume', True):
+                            print(f"All GPUs failed with network volume. Will retry without network volume...", file=sys.stderr)
+                            try_without_nv = True
+                            break
+                        # Otherwise, send critical alert and exit
                         total_time_minutes = int((time.time() - retry_start_time) / 60)
                         telegram.alert_no_gpu_final(
                             datacenter=datacenter_id or "any",
@@ -2455,6 +2556,100 @@ def main():
                             'error': f'Failed to create pod with any available GPU after {max_retries} attempts. Errors: {"; ".join(final_errors[-5:])}',
                             'pod_id': pod_id,
                             'retry_attempts': max_retries,
+                            'total_wait_minutes': total_time_minutes
+                        }
+                        if args.json:
+                            print(json.dumps(result))
+                        else:
+                            print(f"Error: {result['error']}", file=sys.stderr)
+                        exit(1)
+
+                # Step 5b: If all retries failed with network volume, try without it
+                if try_without_nv and not new_pod_id:
+                    telegram.alert_retry_without_network_volume(
+                        network_volume_id=pod_config.network_volume_id,
+                        datacenter=datacenter_id or "unknown"
+                    )
+                    print(f"Searching all datacenters without network volume constraint...", file=sys.stderr)
+                    
+                    similar_gpus = cloud_mgr.find_similar_gpus(
+                        target_gpu_type=pod_config.gpu_type_id,
+                        target_mem_gb=gpu_mem_gb,
+                        datacenter_id=None,
+                        max_price=args.max_price
+                    )
+                    
+                    if not similar_gpus:
+                        total_time_minutes = int((time.time() - retry_start_time) / 60)
+                        telegram.alert_no_gpu_final(
+                            datacenter="all datacenters",
+                            gpu_type=pod_config.gpu_type_id,
+                            max_price=args.max_price,
+                            attempts=max_retries + 1,
+                            total_time_minutes=total_time_minutes
+                        )
+                        loki.log_operation_failed(
+                            "recreate",
+                            "No GPU available even without network volume constraint",
+                            datacenter="all datacenters"
+                        )
+                        result = {
+                            'success': False,
+                            'error': f'No suitable GPU found even without network volume (max price: ${args.max_price}/hr)',
+                            'pod_id': pod_id,
+                            'original_gpu': pod_config.gpu_type_id,
+                            'retry_attempts': max_retries + 1,
+                            'total_wait_minutes': total_time_minutes
+                        }
+                        if args.json:
+                            print(json.dumps(result))
+                        else:
+                            print(f"Error: {result['error']}", file=sys.stderr)
+                        exit(1)
+                    
+                    print(f"Found {len(similar_gpus)} GPUs without network volume constraint", file=sys.stderr)
+                    nv_errors = []
+                    for gpu in similar_gpus:
+                        try:
+                            new_pod_id = cloud_mgr.create_pod_graphql(
+                                gpu_type_id=gpu.gpu_type,
+                                template_id=pod_config.template_id,
+                                network_volume_id=None,
+                                datacenter_id=None,
+                                pod_name=original_pod_name,
+                                gpu_count=pod_config.gpu_count,
+                                container_disk_in_gb=pod_config.container_disk_in_gb,
+                                volume_in_gb=pod_config.volume_in_gb,
+                                min_memory_in_gb=pod_config.memory_in_gb or 251,
+                                min_vcpu_count=pod_config.vcpu_count or 24
+                            )
+                            if new_pod_id:
+                                used_gpu = gpu
+                                print(f"Created pod {new_pod_id} with {gpu.gpu_type} (no network volume)", file=sys.stderr)
+                                break
+                        except Exception as e:
+                            nv_errors.append(f"{gpu.gpu_type}: {str(e)}")
+                            print(f"Failed to create pod with {gpu.gpu_type}: {e}", file=sys.stderr)
+                    
+                    if not new_pod_id:
+                        total_time_minutes = int((time.time() - retry_start_time) / 60)
+                        telegram.alert_no_gpu_final(
+                            datacenter="all datacenters",
+                            gpu_type=pod_config.gpu_type_id,
+                            max_price=args.max_price,
+                            attempts=max_retries + 1,
+                            total_time_minutes=total_time_minutes
+                        )
+                        loki.log_operation_failed(
+                            "recreate",
+                            f"Failed to create pod without network volume: {'; '.join(nv_errors[-3:])}",
+                            datacenter="all datacenters"
+                        )
+                        result = {
+                            'success': False,
+                            'error': f'Failed to create pod even without network volume. Errors: {"; ".join(nv_errors[-5:])}',
+                            'pod_id': pod_id,
+                            'retry_attempts': max_retries + 1,
                             'total_wait_minutes': total_time_minutes
                         }
                         if args.json:
