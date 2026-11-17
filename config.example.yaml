@@ -1,0 +1,45 @@
+# Copy to config.yaml. Keep secrets in .env, not here.
+data_dir: /data
+
+server:
+  host: 0.0.0.0
+  port: 8080
+  secure_cookies: false
+
+runpod:
+  api_key_file: ""
+
+notifications:
+  telegram:
+    enabled: false
+    bot_token: ${TELEGRAM_BOT_TOKEN}
+    chat_id: ${TELEGRAM_CHAT_ID}
+  loki:
+    enabled: false
+    url: ${LOKI_URL}
+  smtp:
+    enabled: false
+    host: ${SMTP_HOST}
+    port: 587
+    username: ${SMTP_USERNAME}
+    password: ${SMTP_PASSWORD}
+    from: ${SMTP_FROM}
+    to: ${SMTP_TO}
+    use_tls: true
+
+defaults:
+  min_gpu_mem_gb: 80
+  min_vcpu: 16
+  max_price: 4.00
+  search_timeout: 1200
+  poll_interval: 15
+
+pods:
+  - name: riva
+    template_id: ${RIVA_TEMPLATE_ID}
+    network_volume_id: ${RIVA_NETWORK_VOLUME_ID}
+    image_name: docker.io/example/riva:latest
+    preferred_gpu: NVIDIA H200
+    min_gpu_mem_gb: 140
+    min_vcpu: 20
+    max_price: 4.00

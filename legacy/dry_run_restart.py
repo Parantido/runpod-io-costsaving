@@ -63,8 +63,11 @@ def main():
     parser = argparse.ArgumentParser(description="Dry-run simulation for restart-or-recreate")
     parser.add_argument('--pod-id', help='Pod ID to simulate (default: from current_pod_id file)')
     parser.add_argument('--max-price', type=float, default=5.0, help='Maximum price per hour (default: 5.0)')
-    parser.add_argument('--max-retries', type=int, default=3, help='Max retry attempts (default: 3)')
-    parser.add_argument('--retry-interval', type=int, default=300, help='Retry interval in seconds (default: 300)')
+    parser.add_argument('--search-timeout', type=int, default=1200, help='Search deadline in seconds (default: 1200)')
+    parser.add_argument('--poll-interval', type=int, default=15, help='Seconds between polls (default: 15)')
+    parser.add_argument('--fallback-gpu', help='Preferred GPU type (as passed to restart-or-recreate)')
+    parser.add_argument('--fallback-min-mem', type=int, default=80, help='Min GPU memory in GB (default: 80)')
+    parser.add_argument('--fallback-min-vcpu', type=int, default=16, help='Min vCPU count (default: 16)')
     parser.add_argument('--verbose', '-v', action='store_true', help='Show verbose output')
     parser.add_argument('--send-test-alert', action='store_true', help='Send a test alert showing what would be sent on failure')
     args = parser.parse_args()
@@ -72,15 +75,18 @@ def main():
     print_header("RunPod Restart-or-Recreate DRY RUN Simulation")
     print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Max Price: ${args.max_price:.2f}/hr")
-    print(f"Max Retries: {args.max_retries}")
-    print(f"Retry Interval: {args.retry_interval}s ({args.retry_interval//60} minutes)")
+    print(f"Min GPU Mem: {args.fallback_min_mem} GB | Min vCPU: {args.fallback_min_vcpu}")
+    if args.fallback_gpu:
+        print(f"Preferred GPU: {args.fallback_gpu}")
+    print(f"Search Timeout: {args.search_timeout}s ({args.search_timeout//60} minutes)")
+    print(f"Poll Interval:  {args.poll_interval}s")
 
     # Initialize managers
     cloud_mgr = CloudManager()
-    
+
     # Step 1: Get current pod ID
     print_step(1, "Loading Current Pod Configuration")
-    
+
     pod_id = args.pod_id
     if not pod_id:
         pod_id_file = os.path.join(SCRIPT_DIR, 'logs', 'current_pod_id')
@@ -89,28 +95,34 @@ def main():
                 pod_id = f.read().strip()
             print(f"Pod ID (from file): {pod_id}")
         except FileNotFoundError:
-            print("ERROR: No pod ID specified and current_pod_id file not found")
-            sys.exit(1)
+            print("WARNING: No pod ID found - will simulate pure fallback config")
+            pod_id = None
     else:
         print(f"Pod ID (from args): {pod_id}")
 
     # Step 2: Get pod configuration
     print_step(2, "Fetching Pod Configuration from RunPod API")
-    
-    try:
-        pod_config = cloud_mgr.get_pod_config(pod_id)
-        print(f"Pod Name:          {pod_config.name}")
-        print(f"GPU Type:          {pod_config.gpu_type_id}")
-        print(f"GPU Count:         {pod_config.gpu_count}")
-        print(f"Template ID:       {pod_config.template_id}")
-        print(f"Network Volume:    {pod_config.network_volume_id}")
-        print(f"Container Disk:    {pod_config.container_disk_in_gb} GB")
-        print(f"Memory:            {pod_config.memory_in_gb} GB")
-        print(f"vCPU:              {pod_config.vcpu_count}")
-        if pod_config.cost_per_hr:
-            print(f"Current Cost:      ${pod_config.cost_per_hr:.2f}/hr")
-    except Exception as e:
-        print(f"ERROR: Failed to get pod config: {e}")
+
+    pod_config = None
+    if pod_id:
+        try:
+            pod_config = cloud_mgr.get_pod_config(pod_id)
+            print(f"Pod Name:          {pod_config.name}")
+            print(f"GPU Type:          {pod_config.gpu_type_id}")
+            print(f"GPU Count:         {pod_config.gpu_count}")
+            print(f"Template ID:       {pod_config.template_id}")
+            print(f"Network Volume:    {pod_config.network_volume_id}")
+            print(f"Container Disk:    {pod_config.container_disk_in_gb} GB")
+            print(f"Memory:            {pod_config.memory_in_gb} GB")
+            print(f"vCPU:              {pod_config.vcpu_count}")
+            if pod_config.cost_per_hr:
+                print(f"Current Cost:      ${pod_config.cost_per_hr:.2f}/hr")
+        except Exception as e:
+            print(f"WARNING: Failed to get pod config: {e} - using fallback config only")
+            pod_config = None
+
+    if pod_config is None and not args.fallback_gpu:
+        print("ERROR: No pod config and no --fallback-gpu given; nothing to simulate")
         sys.exit(1)
 
     # Step 3: Get network volume datacenter
@@ -119,7 +131,7 @@ def main():
     datacenter_id = None
     datacenter_name = None
     
-    if pod_config.network_volume_id:
+    if pod_config and pod_config.network_volume_id:
         try:
             vol_info = cloud_mgr.get_network_volume_info(pod_config.network_volume_id)
             datacenter_id = vol_info.get('datacenter_id')
@@ -147,25 +159,18 @@ def main():
     else:
         print("Searching globally (no datacenter constraint)")
     
-    # Get GPU memory from current config or API
-    gpu_mem_gb = 140  # Default for H200
-    if pod_config.gpu_type_id:
-        try:
-            gpu_info = cloud_mgr.get_gpu_type_info(pod_config.gpu_type_id)
-            if gpu_info and 'memoryInGb' in gpu_info:
-                gpu_mem_gb = gpu_info['memoryInGb']
-        except:
-            pass
-    
-    print(f"\nTarget GPU: {pod_config.gpu_type_id} ({gpu_mem_gb} GB)")
+    target_gpu = (pod_config.gpu_type_id if pod_config else None) or args.fallback_gpu
+
+    print(f"\nTarget GPU: {target_gpu}")
     print(f"Max Price: ${args.max_price:.2f}/hr")
+    print(f"Min GPU Mem: {args.fallback_min_mem} GB | Min vCPU: {args.fallback_min_vcpu}")
     print("\nQuerying available GPUs...")
-    
-    similar_gpus = cloud_mgr.find_similar_gpus(
-        target_gpu_type=pod_config.gpu_type_id,
-        target_mem_gb=gpu_mem_gb,
-        datacenter_id=datacenter_id,
-        max_price=args.max_price
+
+    similar_gpus = cloud_mgr.find_booking_candidates(
+        min_mem=args.fallback_min_mem,
+        min_vcpu=args.fallback_min_vcpu,
+        max_price=args.max_price,
+        preferred_gpu=args.fallback_gpu or target_gpu,
     )
 
     # Step 6: Display results
@@ -176,19 +181,19 @@ def main():
         print(f"   No GPUs found matching requirements in datacenter {datacenter_id or 'any'}")
         print(f"   Max price filter: ${args.max_price:.2f}/hr")
         print("\n   In real scenario, this would trigger:")
-        print(f"   - Retry 1/{args.max_retries}: Wait {args.retry_interval//60} minutes, try again")
-        print(f"   - Retry 2/{args.max_retries}: Wait {args.retry_interval//60} minutes, try again")
-        print(f"   - Retry 3/{args.max_retries}: CRITICAL alert sent, script exits")
-        
+        print(f"   - Re-poll availability every {args.poll_interval}s (fresh list each round)")
+        print(f"   - Keep trying for up to {args.search_timeout//60} minutes")
+        print(f"   - Deadline reached: CRITICAL alert sent, script exits")
+
         if args.send_test_alert:
             print("\n   Sending test CRITICAL alert...")
             telegram = TelegramNotifier()
             telegram.alert_no_gpu_final(
                 datacenter=datacenter_id or "any",
-                gpu_type=pod_config.gpu_type_id,
+                gpu_type=target_gpu,
                 max_price=args.max_price,
-                attempts=args.max_retries,
-                total_time_minutes=(args.max_retries - 1) * (args.retry_interval // 60)
+                attempts=args.search_timeout // args.poll_interval,
+                total_time_minutes=args.search_timeout // 60
             )
             print("   ✓ Test alert sent!")
     else:
@@ -197,7 +202,7 @@ def main():
         print("-" * 85)
         
         for i, gpu in enumerate(similar_gpus, 1):
-            is_exact = "✓ EXACT" if gpu.gpu_type == pod_config.gpu_type_id else ""
+            is_exact = "✓ PREFERRED" if gpu.gpu_type.lower() == target_gpu.lower() else ""
             print(f"{i:<3} {gpu.gpu_type:<25} {gpu.mem_gb:<10} GB {format_price(gpu.ondemand_price):<12} {format_stock(gpu.stock_status):<15} {is_exact}")
         
         print("\n" + "-" * 85)
@@ -210,9 +215,9 @@ def main():
         print(f"            Price: {format_price(best_gpu.ondemand_price)}")
         print(f"            Stock: {format_stock(best_gpu.stock_status)}")
         
-        if best_gpu.gpu_type != pod_config.gpu_type_id:
-            print(f"\n⚠️  Note: This is NOT the same GPU type as current ({pod_config.gpu_type_id})")
-            if best_gpu.ondemand_price and pod_config.cost_per_hr:
+        if best_gpu.gpu_type.lower() != target_gpu.lower():
+            print(f"\n⚠️  Note: This is NOT the same GPU type as target ({target_gpu})")
+            if best_gpu.ondemand_price and pod_config and pod_config.cost_per_hr:
                 diff = best_gpu.ondemand_price - pod_config.cost_per_hr
                 if diff > 0:
                     print(f"   Cost increase: +${diff:.2f}/hr")
@@ -223,9 +228,9 @@ def main():
             print("\n   Sending test SUCCESS alert (simulating successful recreation)...")
             telegram = TelegramNotifier()
             telegram.alert_pod_recreated(
-                old_pod_id=pod_id,
+                old_pod_id=pod_id or "dry-run",
                 new_pod_id="dry-run-test-id",
-                pod_name=pod_config.name,
+                pod_name=pod_config.name if pod_config else "fallback-pod",
                 gpu_type=best_gpu.gpu_type,
                 datacenter=datacenter_id or "auto",
                 cost_per_hr=best_gpu.ondemand_price or 0
@@ -234,21 +239,21 @@ def main():
 
     # Summary
     print_header("Dry Run Summary")
-    print(f"Current Pod:       {pod_id}")
-    print(f"Pod Name:          {pod_config.name}")
-    print(f"Current GPU:       {pod_config.gpu_type_id}")
+    print(f"Current Pod:       {pod_id or 'none (fallback config)'}")
+    print(f"Pod Name:          {pod_config.name if pod_config else 'fallback-pod'}")
+    print(f"Target GPU:        {target_gpu}")
     print(f"Datacenter:        {datacenter_name or datacenter_id or 'Any'}")
     print(f"Available GPUs:    {len(similar_gpus)}")
     print(f"Max Price:         ${args.max_price:.2f}/hr")
-    print(f"Max Retries:       {args.max_retries}")
-    print(f"Retry Interval:    {args.retry_interval//60} minutes")
+    print(f"Search Timeout:   {args.search_timeout}s ({args.search_timeout//60} minutes)")
+    print(f"Poll Interval:    {args.poll_interval}s")
     
     if similar_gpus:
         print(f"\n✅ RESULT: Recreation would SUCCEED")
         print(f"   Best option: {similar_gpus[0].gpu_type} @ {format_price(similar_gpus[0].ondemand_price)}")
     else:
-        print(f"\n❌ RESULT: Recreation would FAIL after {args.max_retries} retries")
-        print(f"   Total wait time: ~{(args.max_retries - 1) * (args.retry_interval // 60)} minutes")
+        print(f"\n❌ RESULT: Recreation would FAIL after {args.search_timeout//60} minutes of polling")
+        print(f"   Polls every {args.poll_interval}s with a fresh GPU list each round")
         print(f"   A CRITICAL alert would be sent to Telegram and logged to Loki")
     
     print("\n" + "=" * 60)

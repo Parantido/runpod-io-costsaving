@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Pods - runpod-ops{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Pods</h1>
+  <span class="muted">{{ pods|length }} configured</span>
+</div>
+{% if not pods %}
+<section class="card">
+  <p>No pods configured. Add a <code>pods</code> list to your config file.</p>
+</section>
+{% else %}
+<table>
+  <thead>
+    <tr><th>Name</th><th>Pod ID</th><th>Status</th><th>Last job</th><th>Actions</th></tr>
+  </thead>
+  <tbody>
+  {% for entry in pods %}
+    <tr>
+      <td><a href="/pods/{{ entry.profile.name }}">{{ entry.profile.name }}</a></td>
+      <td><code>{{ entry.pod_id or "-" }}</code></td>
+      <td><span class="status status-{{ entry.status|lower }}">{{ entry.status }}</span></td>
+      <td>
+        {% if entry.last_job %}
+          <a href="/jobs/{{ entry.last_job.id }}">{{ entry.last_job.action }} · {{ entry.last_job.status }}</a>
+        {% else %}<span class="muted">-</span>{% endif %}
+      </td>
+      <td class="actions">
+        {% for action in ["start", "stop", "recreate", "terminate"] %}
+        <form method="post" action="/pods/{{ entry.profile.name }}/{{ action }}" class="inline">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="btn btn-{{ action }}">{{ action }}</button>
+        </form>
+        {% endfor %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}

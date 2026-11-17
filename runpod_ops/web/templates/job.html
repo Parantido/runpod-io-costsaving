@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Job {{ job.id[:10] }} - runpod-ops{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Job <code>{{ job.id[:10] }}</code></h1>
+  <span class="status status-{{ job.status }}">{{ job.status }}</span>
+</div>
+<section class="card">
+  <dl>
+    <dt>Pod</dt><dd><a href="/pods/{{ job.pod }}">{{ job.pod }}</a></dd>
+    <dt>Action</dt><dd>{{ job.action }}</dd>
+    <dt>Exit code</dt><dd>{{ job.exit_code if job.exit_code is not none else "-" }}</dd>
+    <dt>Created</dt><dd class="muted">{{ job.created_at }}</dd>
+    <dt>Command</dt><dd><code>{{ job.command }}</code></dd>
+  </dl>
+</section>
+<section class="card">
+  <h2>Output</h2>
+  <div id="log">{% include "_log.html" %}</div>
+</section>
+<script>
+  const finished = {{ "true" if job.status in ["succeeded", "failed"] else "false" }};
+  if (!finished) {
+    const timer = setInterval(async () => {
+      const response = await fetch("/jobs/{{ job.id }}/log");
+      if (response.ok) {
+        document.getElementById("log").innerHTML = await response.text();
+      }
+    }, 2000);
+  }
+</script>
+{% endblock %}

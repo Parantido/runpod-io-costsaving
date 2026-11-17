@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}{{ profile.name }} - runpod-ops{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>{{ profile.name }}</h1>
+  <span class="status status-{{ status|lower }}">{{ status }}</span>
+</div>
+<section class="card">
+  <dl>
+    <dt>Pod ID</dt><dd><code>{{ pod_id or "not created yet" }}</code></dd>
+    <dt>Template</dt><dd><code>{{ profile.template_id }}</code></dd>
+    <dt>Network volume</dt><dd><code>{{ profile.network_volume_id or "-" }}</code></dd>
+    <dt>Preferred GPU</dt><dd>{{ profile.preferred_gpu or "any qualifying GPU" }}</dd>
+    <dt>GPU policy</dt><dd>≥ {{ profile.min_gpu_mem_gb }} GB, ≥ {{ profile.min_vcpu }} vCPU, ≤ ${{ "%.2f"|format(profile.max_price) }}/hr</dd>
+  </dl>
+  <div class="actions">
+    {% for action in ["start", "stop", "recreate", "terminate"] %}
+    <form method="post" action="/pods/{{ profile.name }}/{{ action }}" class="inline">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit" class="btn btn-{{ action }}">{{ action }}</button>
+    </form>
+    {% endfor %}
+  </div>
+</section>
+<section class="card">
+  <h2>Recent jobs</h2>
+  {% if jobs %}
+  <table>
+    <thead><tr><th>Job</th><th>Action</th><th>Status</th><th>Created</th></tr></thead>
+    <tbody>
+    {% for job in jobs %}
+      <tr>
+        <td><a href="/jobs/{{ job.id }}"><code>{{ job.id[:10] }}</code></a></td>
+        <td>{{ job.action }}</td>
+        <td><span class="status status-{{ job.status }}">{{ job.status }}</span></td>
+        <td class="muted">{{ job.created_at }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="muted">No jobs yet.</p>{% endif %}
+</section>
+{% endblock %}

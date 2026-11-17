@@ -1,0 +1,94 @@
+# m h  dom mon dow   command
+#
+# Always stop the LLM Pod
+00 18 * * * /usr/local/bin/runpodctl stop pod qmmc4s4op1t9rq
+#######################################################################################################################################################################################################################################
+#######################################################################################################################################################################################################################################
+## Start the Small RunPod Instance up (tr-gpu-02-prod, RTX 4090, priority 40, 7 days/week)
+00 13 * * 1-6 /root/mgmt/runpod/runpod_costsaving.py restart-or-recreate --pod-id-file /root/mgmt/runpod/logs/tr-gpu-02-prod.pod_id --fallback-template-id otppspsd58 --fallback-image-name "docker.io/parantido/riva-speech-runpod:2.19.2" --fallback-gpu "NVIDIA GeForce RTX 4090" --fallback-name "tr-gpu-02-prod" --max-price 3.00 --try-without-network-volume --json
+## Update TRANSCSERVER with the newly created RunPod Instance ip address and port (both VMs for redundancy)
+40 13 * * 1-6 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-02-prod.pod_id --update-transcserver --method captcha   --api-url "http://69.167.170.194:4000"
+40 13 * * 1-6 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-02-prod.pod_id --update-transcserver --method captcha   --api-url "http://67.227.250.244:4000"
+40 13 * * 1-6 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-02-prod.pod_id --update-transcserver --method diversion --api-url "http://69.167.170.194:4000"
+40 13 * * 1-6 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-02-prod.pod_id --update-transcserver --method diversion --api-url "http://67.227.250.244:4000"
+## Register tr-gpu-02-prod as dynamic RIVA server in Node.js API
+41 13 * * 1-6 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-02-prod.pod_id --update-riva-server --riva-pod-name tr-gpu-02-prod --riva-priority 40 --riva-api-url "http://69.167.170.194:4000"
+41 13 * * 1-6 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-02-prod.pod_id --update-riva-server --riva-pod-name tr-gpu-02-prod --riva-priority 40 --riva-api-url "http://67.227.250.244:4000"
+## Remove tr-gpu-02-prod from Node.js API before shutdown
+59 01 * * * /root/mgmt/runpod/update-webservice.sh --remove-riva-server --riva-pod-name tr-gpu-02-prod --riva-api-url "http://69.167.170.194:4000"
+59 01 * * * /root/mgmt/runpod/update-webservice.sh --remove-riva-server --riva-pod-name tr-gpu-02-prod --riva-api-url "http://67.227.250.244:4000"
+## Shut the RunPod instance down
+00 02 * * * /root/mgmt/runpod/runpod_costsaving.py --json --pod-id-file /root/mgmt/runpod/logs/tr-gpu-02-prod.pod_id remove
+## Revert TRANSCSERVER to onprem after shutdown
+01 02 * * * /root/mgmt/runpod/update-webservice.sh --update-transcserver --method captcha   --transcserver-value "50.28.84.88:50051" --api-url "http://69.167.170.194:4000"
+01 02 * * * /root/mgmt/runpod/update-webservice.sh --update-transcserver --method captcha   --transcserver-value "50.28.84.88:50051" --api-url "http://67.227.250.244:4000"
+01 02 * * * /root/mgmt/runpod/update-webservice.sh --update-transcserver --method diversion --transcserver-value "50.28.84.88:50051" --api-url "http://69.167.170.194:4000"
+01 02 * * * /root/mgmt/runpod/update-webservice.sh --update-transcserver --method diversion --transcserver-value "50.28.84.88:50051" --api-url "http://67.227.250.244:4000"
+####
+## Start the Third Small RunPod Instance up (tr-gpu-03-prod, RTX 4090, priority 30, 7 days/week)
+00 13 * * 1-6 /root/mgmt/runpod/runpod_costsaving.py restart-or-recreate --pod-id-file /root/mgmt/runpod/logs/tr-gpu-03-prod.pod_id --fallback-template-id otppspsd58 --fallback-image-name "docker.io/parantido/riva-speech-runpod:2.19.2" --fallback-gpu "NVIDIA GeForce RTX 4090" --fallback-name "tr-gpu-03-prod" --max-price 3.00 --try-without-network-volume --json
+## Update TRANSCSERVER with tr-gpu-03-prod (last GPU arriving = elected reference)
+42 13 * * 1-6 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-03-prod.pod_id --update-transcserver --method captcha   --api-url "http://69.167.170.194:4000"
+42 13 * * 1-6 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-03-prod.pod_id --update-transcserver --method captcha   --api-url "http://67.227.250.244:4000"
+42 13 * * 1-6 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-03-prod.pod_id --update-transcserver --method diversion --api-url "http://69.167.170.194:4000"
+42 13 * * 1-6 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-03-prod.pod_id --update-transcserver --method diversion --api-url "http://67.227.250.244:4000"
+## Register tr-gpu-03-prod as dynamic RIVA server in Node.js API
+43 13 * * 1-6 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-03-prod.pod_id --update-riva-server --riva-pod-name tr-gpu-03-prod --riva-priority 30 --riva-api-url "http://69.167.170.194:4000"
+43 13 * * 1-6 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-03-prod.pod_id --update-riva-server --riva-pod-name tr-gpu-03-prod --riva-priority 30 --riva-api-url "http://67.227.250.244:4000"
+## Remove tr-gpu-03-prod from Node.js API before shutdown
+59 01 * * * /root/mgmt/runpod/update-webservice.sh --remove-riva-server --riva-pod-name tr-gpu-03-prod --riva-api-url "http://69.167.170.194:4000"
+59 01 * * * /root/mgmt/runpod/update-webservice.sh --remove-riva-server --riva-pod-name tr-gpu-03-prod --riva-api-url "http://67.227.250.244:4000"
+## Shut the RunPod instance down
+00 02 * * * /root/mgmt/runpod/runpod_costsaving.py --json --pod-id-file /root/mgmt/runpod/logs/tr-gpu-03-prod.pod_id remove
+## Revert TRANSCSERVER to onprem after shutdown
+01 02 * * * /root/mgmt/runpod/update-webservice.sh --update-transcserver --method captcha   --transcserver-value "50.28.84.88:50051" --api-url "http://69.167.170.194:4000"
+01 02 * * * /root/mgmt/runpod/update-webservice.sh --update-transcserver --method captcha   --transcserver-value "50.28.84.88:50051" --api-url "http://67.227.250.244:4000"
+01 02 * * * /root/mgmt/runpod/update-webservice.sh --update-transcserver --method diversion --transcserver-value "50.28.84.88:50051" --api-url "http://69.167.170.194:4000"
+01 02 * * * /root/mgmt/runpod/update-webservice.sh --update-transcserver --method diversion --transcserver-value "50.28.84.88:50051" --api-url "http://67.227.250.244:4000"
+####
+## Start the Fourth Small RunPod Instance up (tr-gpu-04-prod, RTX A6000, priority 20, 7 days/week)
+00 13 * * 1-6 /root/mgmt/runpod/runpod_costsaving.py restart-or-recreate --pod-id-file /root/mgmt/runpod/logs/tr-gpu-04-prod.pod_id --fallback-template-id otppspsd58 --fallback-image-name "docker.io/parantido/riva-speech-runpod:2.19.2" --fallback-gpu "NVIDIA GeForce RTX 4090" --fallback-name "tr-gpu-04-prod" --max-price 3.00 --try-without-network-volume --json
+## Update TRANSCSERVER with tr-gpu-04-prod (last GPU arriving = elected reference)
+44 13 * * 1-6 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-04-prod.pod_id --update-transcserver --method captcha   --api-url "http://69.167.170.194:4000"
+44 13 * * 1-6 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-04-prod.pod_id --update-transcserver --method captcha   --api-url "http://67.227.250.244:4000"
+44 13 * * 1-6 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-04-prod.pod_id --update-transcserver --method diversion --api-url "http://69.167.170.194:4000"
+44 13 * * 1-6 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-04-prod.pod_id --update-transcserver --method diversion --api-url "http://67.227.250.244:4000"
+## Register tr-gpu-04-prod as dynamic RIVA server in Node.js API
+45 13 * * 1-6 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-04-prod.pod_id --update-riva-server --riva-pod-name tr-gpu-04-prod --riva-priority 20 --riva-api-url "http://69.167.170.194:4000"
+45 13 * * 1-6 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-04-prod.pod_id --update-riva-server --riva-pod-name tr-gpu-04-prod --riva-priority 20 --riva-api-url "http://67.227.250.244:4000"
+## Remove tr-gpu-04-prod from Node.js API before shutdown
+59 01 * * * /root/mgmt/runpod/update-webservice.sh --remove-riva-server --riva-pod-name tr-gpu-04-prod --riva-api-url "http://69.167.170.194:4000"
+59 01 * * * /root/mgmt/runpod/update-webservice.sh --remove-riva-server --riva-pod-name tr-gpu-04-prod --riva-api-url "http://67.227.250.244:4000"
+## Shut the RunPod instance down
+00 02 * * * /root/mgmt/runpod/runpod_costsaving.py --json --pod-id-file /root/mgmt/runpod/logs/tr-gpu-04-prod.pod_id remove
+#######################################################################################################################################################################################################################################
+#######################################################################################################################################################################################################################################
+## Start the Medium RunPod Instance up (tr-gpu-01-prod, RTX PRO 6000, priority 50, weekdays only)
+15 13 * * 1-5 /root/mgmt/runpod/runpod_costsaving.py restart-or-recreate --pod-id-file /root/mgmt/runpod/logs/tr-gpu-01-prod.pod_id --fallback-template-id otppspsd58 --fallback-image-name "docker.io/parantido/riva-speech-runpod:2.19.2" --fallback-gpu "NVIDIA GeForce RTX 4090" --fallback-name "tr-gpu-01-prod" --max-price 3.00 --try-without-network-volume --json
+## Update Daniel's WebService with the newly created RunPod Instance ip address and port
+55 13 * * 1-5 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-01-prod.pod_id --api-url "https://api.drop.co/GPUMachineUpdate" --gpu-machine-id 3
+55 13 * * 1-5 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-01-prod.pod_id --api-url "https://api.ringlessvoicemail.ai/GPUMachineUpdate" --gpu-machine-id 3
+## Update TRANSCSERVER with the newly created RunPod Instance ip address and port (both VMs for redundancy)
+55 13 * * 1-5 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-01-prod.pod_id --update-transcserver --method captcha   --api-url "http://69.167.170.194:4000"
+55 13 * * 1-5 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-01-prod.pod_id --update-transcserver --method captcha   --api-url "http://67.227.250.244:4000"
+55 13 * * 1-5 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-01-prod.pod_id --update-transcserver --method diversion --api-url "http://69.167.170.194:4000"
+55 13 * * 1-5 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-01-prod.pod_id --update-transcserver --method diversion --api-url "http://67.227.250.244:4000"
+## Register tr-gpu-01-prod as dynamic RIVA server in Node.js API
+56 13 * * 1-5 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-01-prod.pod_id --update-riva-server --riva-pod-name tr-gpu-01-prod --riva-priority 50 --riva-api-url "http://69.167.170.194:4000"
+56 13 * * 1-5 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-01-prod.pod_id --update-riva-server --riva-pod-name tr-gpu-01-prod --riva-priority 50 --riva-api-url "http://67.227.250.244:4000"
+## Remove tr-gpu-01-prod from Node.js API before shutdown
+19 23 * * 1-5 /root/mgmt/runpod/update-webservice.sh --remove-riva-server --riva-pod-name tr-gpu-01-prod --riva-api-url "http://69.167.170.194:4000"
+19 23 * * 1-5 /root/mgmt/runpod/update-webservice.sh --remove-riva-server --riva-pod-name tr-gpu-01-prod --riva-api-url "http://67.227.250.244:4000"
+## Shut the RunPod instance down
+20 23 * * * /root/mgmt/runpod/runpod_costsaving.py --json --pod-id-file /root/mgmt/runpod/logs/tr-gpu-01-prod.pod_id remove
+#####
+## Re-point TRANSCSERVER to tr-gpu-02-prod (still running until 02:00) — avoids gap
+21 23 * * 1-5 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-02-prod.pod_id --update-transcserver --method captcha   --api-url "http://69.167.170.194:4000"
+21 23 * * 1-5 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-02-prod.pod_id --update-transcserver --method captcha   --api-url "http://67.227.250.244:4000"
+21 23 * * 1-5 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-02-prod.pod_id --update-transcserver --method diversion --api-url "http://69.167.170.194:4000"
+21 23 * * 1-5 /root/mgmt/runpod/update-webservice.sh --pod-id-file /root/mgmt/runpod/logs/tr-gpu-02-prod.pod_id --update-transcserver --method diversion --api-url "http://67.227.250.244:4000"
+#######################################################################################################################################################################################################################################
+## LLM Pod Lifecycle (weekday schedule, 09:00-17:00 UTC)
+# 0 7 * * 1-5 /root/mgmt/runpod/llm_lifecycle.py start >> /root/mgmt/runpod/logs/llm-lifecycle.log 2>&1
+0 15 * * 1-5 /root/mgmt/runpod/llm_lifecycle.py terminate >> /root/mgmt/runpod/logs/llm-lifecycle.log 2>&1
+#######################################################################################################################################################################################################################################

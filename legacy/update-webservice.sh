@@ -44,16 +44,31 @@ send_telegram() {
     local full_message="${icon} *${level}*
 ${message}"
 
-    curl -s -X POST \
-        "https://api.telegram.org/bot${_TELEGRAM_TOKEN}/sendMessage" \
-        -H "Content-Type: application/json" \
-        -d "$(jq -n \
-            --arg chat_id "$_TELEGRAM_CHAT_ID" \
-            --arg text "$full_message" \
-            '{chat_id: $chat_id, text: $text, parse_mode: "Markdown"}')" \
-        >/dev/null 2>&1
+    local payload
+    payload="$(jq -n \
+        --arg chat_id "$_TELEGRAM_CHAT_ID" \
+        --arg text "$full_message" \
+        '{chat_id: $chat_id, text: $text, parse_mode: "Markdown"}')"
 
-    return $?
+    # Alerts must be verifiable: retry, log delivery proof, scream on final failure.
+    local attempt resp http_code ok msg_id
+    for attempt in 1 2 3; do
+        resp="$(curl -s --max-time 15 -w '\n%{http_code}' -X POST \
+            "https://api.telegram.org/bot${_TELEGRAM_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "$payload" 2>&1)"
+        http_code="$(echo "$resp" | tail -n 1)"
+        ok="$(echo "$resp" | head -n -1 | jq -r '.ok // false' 2>/dev/null)"
+        if [ "$http_code" = "200" ] && [ "$ok" = "true" ]; then
+            msg_id="$(echo "$resp" | head -n -1 | jq -r '.result.message_id // empty' 2>/dev/null)"
+            log "INFO" "Telegram alert sent [$level] (message_id=$msg_id)"
+            return 0
+        fi
+        log "WARN" "Telegram send failed (attempt $attempt/3): http=$http_code resp=$(echo "$resp" | head -n -1 | head -c 200)"
+        sleep 5
+    done
+    log "ERROR" "Telegram alert NOT delivered [$level]: $message"
+    return 1
 }
 
 # ============================================================
@@ -212,7 +227,7 @@ if [ "$_REMOVE_RIVA_SERVER" = "true" ]; then
 
     if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
         log "INFO" "Successfully removed RIVA server '${_RIVA_POD_NAME}'"
-        send_telegram "INFO" "RIVA server removed$'\n\n'Pod: \`${_RIVA_POD_NAME}\`"
+        send_telegram "INFO" "RIVA server removed"$'\n\n'"Pod: \`${_RIVA_POD_NAME}\`"
         echo "RIVA server '${_RIVA_POD_NAME}' removed successfully."
         exit 0
     elif [ "$HTTP_CODE" = "404" ]; then
@@ -221,7 +236,7 @@ if [ "$_REMOVE_RIVA_SERVER" = "true" ]; then
         exit 0
     else
         log "ERROR" "Failed to remove RIVA server. HTTP Code: $HTTP_CODE, Response: $HTTP_BODY"
-        send_telegram "ERROR" "RIVA server removal failed$'\n\n'Pod: \`${_RIVA_POD_NAME}\`$'\n'HTTP Code: ${HTTP_CODE}"
+        send_telegram "ERROR" "RIVA server removal failed"$'\n\n'"Pod: \`${_RIVA_POD_NAME}\`"$'\n'"HTTP Code: ${HTTP_CODE}"
         exit 1
     fi
 fi
@@ -279,7 +294,13 @@ if [ "$_NEED_POD_INFO" = "true" ] && [ -n "$POD_ID" ]; then
                 sleep $_INFO_DELAY
                 continue
             fi
-            send_telegram "ERROR" "update-webservice failed to get info for pod \`${POD_ID}\`$'\n\n'Error: ${_INFO_STDERR}"
+            _POD_ID_BASENAME="$(basename "${_POD_ID_FILE:-}" 2>/dev/null)"
+            case "$_POD_ID_BASENAME" in
+                *.pod_id) _POD_NAME_GUESS="${_POD_ID_BASENAME%.pod_id}" ;;
+                current_pod_id|"."|"") _POD_NAME_GUESS="unknown" ;;
+                *) _POD_NAME_GUESS="$_POD_ID_BASENAME" ;;
+            esac
+            send_telegram "ERROR" "update-webservice failed to get info for pod \`${POD_ID}\` (${_POD_NAME_GUESS})"$'\n\n'"Machine ID: ${_GPU_MACHINE_ID}"$'\n'"Error: ${_INFO_STDERR}"
             send_email "RunPod Update Webservice Failed" "Failed to get pod $POD_ID information.\n\nError: ${_INFO_STDERR}"
             exit 1
         fi
@@ -298,7 +319,7 @@ if [ "$_NEED_POD_INFO" = "true" ] && [ -n "$POD_ID" ]; then
         # Check pod is running
         if [ "$POD_STATUS" != "RUNNING" ]; then
             log "ERROR" "Pod is not running (status: $POD_STATUS)"
-            send_telegram "ERROR" "update-webservice: pod \`${POD_ID}\` (${POD_NAME}) is not RUNNING$'\n\n'Status: ${POD_STATUS}$'\n'Machine ID: ${_GPU_MACHINE_ID}"
+            send_telegram "ERROR" "update-webservice: pod \`${POD_ID}\` (${POD_NAME}) is not RUNNING"$'\n\n'"Status: ${POD_STATUS}"$'\n'"Machine ID: ${_GPU_MACHINE_ID}"
             send_email "RunPod Update Webservice Failed" "Pod $POD_ID is not running.\n\nStatus: $POD_STATUS\n\nCannot update webservice."
             exit 1
         fi
@@ -319,7 +340,7 @@ if [ "$_NEED_POD_INFO" = "true" ] && [ -n "$POD_ID" ]; then
     if [ -z "$PUBLIC_IP" ] || [ -z "$PORT_50051" ] || [ "$PUBLIC_IP" = "null" ] || [ "$PORT_50051" = "null" ]; then
         log "ERROR" "Pod is running but IP or port 50051 not available after ${_MAX_INFO_ATTEMPTS} attempts (~$((_MAX_INFO_ATTEMPTS * _INFO_DELAY))s)"
         log "ERROR" "Pod info: $POD_INFO"
-        send_telegram "ERROR" "update-webservice: pod \`${POD_ID}\` (${POD_NAME}) is RUNNING but port 50051 is not exposed$'\n\n'Machine ID: ${_GPU_MACHINE_ID}"
+        send_telegram "ERROR" "update-webservice: pod \`${POD_ID}\` (${POD_NAME}) is RUNNING but port 50051 is not exposed"$'\n\n'"Machine ID: ${_GPU_MACHINE_ID}"
         send_email "RunPod Update Webservice Failed" "Pod $POD_ID is running but port 50051 is not exposed after ${_MAX_INFO_ATTEMPTS} attempts.\n\nPod Info: $POD_INFO"
         exit 1
     fi
@@ -407,12 +428,12 @@ if [ "$_UPDATE_RIVA_SERVER" = "true" ]; then
 
     if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
         log "INFO" "Successfully upserted RIVA server '${_RIVA_POD_NAME}'"
-        send_telegram "SUCCESS" "RIVA server updated$'\n\n'Pod: \`${_RIVA_POD_NAME}\`$'\n'Endpoint: \`${_RIVA_HOST}:${_RIVA_PORT}\`"
+        send_telegram "SUCCESS" "RIVA server updated"$'\n\n'"Pod: \`${_RIVA_POD_NAME}\`"$'\n'"Endpoint: \`${_RIVA_HOST}:${_RIVA_PORT}\`"
         echo "RIVA server '${_RIVA_POD_NAME}' upserted: ${_RIVA_HOST}:${_RIVA_PORT}"
         exit 0
     else
         log "ERROR" "Failed to upsert RIVA server. HTTP Code: $HTTP_CODE, Response: $HTTP_BODY"
-        send_telegram "ERROR" "RIVA server upsert failed$'\n\n'Pod: \`${_RIVA_POD_NAME}\`$'\n'Endpoint: \`${_RIVA_HOST}:${_RIVA_PORT}\`$'\n'HTTP Code: ${HTTP_CODE}"
+        send_telegram "ERROR" "RIVA server upsert failed"$'\n\n'"Pod: \`${_RIVA_POD_NAME}\`"$'\n'"Endpoint: \`${_RIVA_HOST}:${_RIVA_PORT}\`"$'\n'"HTTP Code: ${HTTP_CODE}"
         exit 1
     fi
 elif [ "$_UPDATE_TRANSCSERVER" = "true" ]; then
@@ -434,13 +455,13 @@ elif [ "$_UPDATE_TRANSCSERVER" = "true" ]; then
     
     if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
         log "INFO" "Successfully updated TRANSCSERVER for method=$_METHOD"
-        send_telegram "SUCCESS" "TRANSCSERVER updated$'\n\n'Method: \`${_METHOD}\`$'\n'Value: \`${_TRANSCSERVER_VALUE}\`"
+        send_telegram "SUCCESS" "TRANSCSERVER updated"$'\n\n'"Method: \`${_METHOD}\`"$'\n'"Value: \`${_TRANSCSERVER_VALUE}\`"
         send_debug_email "TRANSCSERVER Updated" "TRANSCSERVER updated successfully!\n\nMethod: $_METHOD\nValue: $_TRANSCSERVER_VALUE\nAPI Response: $HTTP_CODE"
         echo "TRANSCSERVER updated successfully. Method: $_METHOD, Value: $_TRANSCSERVER_VALUE"
         exit 0
     else
         log "ERROR" "Failed to update TRANSCSERVER. HTTP Code: $HTTP_CODE, Response: $HTTP_BODY"
-        send_telegram "ERROR" "TRANSCSERVER update failed$'\n\n'Method: \`${_METHOD}\`$'\n'Value: \`${_TRANSCSERVER_VALUE}\`$'\n'HTTP Code: ${HTTP_CODE}$'\n'Response: $HTTP_BODY"
+        send_telegram "ERROR" "TRANSCSERVER update failed"$'\n\n'"Method: \`${_METHOD}\`"$'\n'"Value: \`${_TRANSCSERVER_VALUE}\`"$'\n'"HTTP Code: ${HTTP_CODE}"$'\n'"Response: $HTTP_BODY"
         send_email "TRANSCSERVER Update Failed" "Failed to update TRANSCSERVER for method $_METHOD.\n\nValue: $_TRANSCSERVER_VALUE\nHTTP Code: $HTTP_CODE\nResponse: $HTTP_BODY"
         exit 1
     fi
@@ -467,12 +488,12 @@ else
     
     if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
         log "INFO" "Successfully updated webservice with pod information"
-        send_telegram "SUCCESS" "Webservice updated$'\n\n'Pod: \`${POD_ID}\` (${POD_NAME})$'\n'Machine ID: ${_GPU_MACHINE_ID}$'\n'Endpoint: \`${GPU_MACHINE_IP}\`"
+        send_telegram "SUCCESS" "Webservice updated"$'\n\n'"Pod: \`${POD_ID}\` (${POD_NAME})"$'\n'"Machine ID: ${_GPU_MACHINE_ID}"$'\n'"Endpoint: \`${GPU_MACHINE_IP}\`"
         send_debug_email "RunPod Webservice Updated" "Webservice updated successfully!\n\nPod ID: $POD_ID\nName: $POD_NAME\nEndpoint: $GPU_MACHINE_IP\nMachine ID: ${_GPU_MACHINE_ID}\nAPI Response: $HTTP_CODE"
         echo "Webservice updated successfully. Endpoint: $GPU_MACHINE_IP"
     else
         log "ERROR" "Failed to update webservice. HTTP Code: $HTTP_CODE, Response: $HTTP_BODY"
-        send_telegram "ERROR" "Webservice update failed$'\n\n'Pod: \`${POD_ID}\` (${POD_NAME})$'\n'Machine ID: ${_GPU_MACHINE_ID}$'\n'Endpoint: \`${GPU_MACHINE_IP}\`$'\n'HTTP Code: ${HTTP_CODE}$'\n'Response: $HTTP_BODY"
+        send_telegram "ERROR" "Webservice update failed"$'\n\n'"Pod: \`${POD_ID}\` (${POD_NAME})"$'\n'"Machine ID: ${_GPU_MACHINE_ID}"$'\n'"Endpoint: \`${GPU_MACHINE_IP}\`"$'\n'"HTTP Code: ${HTTP_CODE}"$'\n'"Response: $HTTP_BODY"
         send_email "RunPod Webservice Update Failed" "Failed to update webservice for pod $POD_ID.\n\nEndpoint: $GPU_MACHINE_IP\nHTTP Code: $HTTP_CODE\nResponse: $HTTP_BODY"
         exit 1
     fi

@@ -1,3 +1,13 @@
+# Product runtime state
+.env
+config.yaml
+data/
+
+# Python tooling
+.venv/
+.pytest_cache/
+*.egg-info/
+
 # Sensitive files - NEVER commit these
 .apiKey
 *.key

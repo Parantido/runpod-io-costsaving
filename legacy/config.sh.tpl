@@ -40,3 +40,21 @@ POD_ID_FILE="${LOG_DIR}/current_pod_id"
 # Set to "true" to receive email notifications for informational and successful steps
 # Set to "false" to only receive error notifications
 DEBUGGING="true"
+
+# LLM lifecycle configuration
+LLM_TEMPLATE_ID="6qhzwmrnjl"
+LLM_POD_NAME="llm-runpod"
+LLM_POD_ID_FILE="/root/mgmt/runpod/logs/llm-runpod.pod_id"
+LLM_MIN_GPU_MEM=48
+LLM_MIN_VCPU=16
+LLM_MAX_ONDEMAND_PRICE=1.50
+LLM_START_TIMEOUT_SECONDS=600
+LLM_CREATE_TIMEOUT_SECONDS=1200
+# Container HTTP port exposed by the RunPod template.
+LLM_HTTP_PORT=8080
+HETZNER_DNS_ZONE_NAME="techfusion.it"
+HETZNER_DNS_RECORD_NAME="runpod.techfusion.it"
+HETZNER_DNS_TTL=60
+HETZNER_DNS_API_TOKEN=""
+# Hetzner Cloud DNS API endpoint (uses Authorization: Bearer token).
+HETZNER_DNS_API_BASE_URL="https://api.hetzner.cloud/v1"
