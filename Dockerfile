@@ -8,7 +8,7 @@ RUN pip wheel --no-cache-dir --wheel-dir /wheels .
 FROM python:3.12-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl jq \
     && curl -fsSL -o /usr/local/bin/runpodctl \
        https://github.com/runpod/runpodctl/releases/latest/download/runpodctl-linux-amd64 \
     && chmod +x /usr/local/bin/runpodctl \
@@ -20,9 +20,13 @@ RUN pip install --no-cache-dir /wheels/*.whl && rm -rf /wheels
 RUN useradd --create-home --uid 10001 runpod \
     && mkdir -p /data && chown runpod:runpod /data
 
+COPY runpod_costsaving.py ./runpod_costsaving.py
+COPY hooks ./hooks
+
 USER runpod
 WORKDIR /app
 ENV RUNPOD_OPS_DATA_DIR=/data \
+    RUNPOD_OPS_ROOT=/app \
     PYTHONUNBUFFERED=1
 
 EXPOSE 8080

@@ -34,6 +34,9 @@ class FakeRunner:
         self.state.finish_job(job_id, "succeeded", 0)
         return job_id
 
+    def wait_for(self, job_id, timeout=0):
+        return "succeeded"
+
 
 class FakeProvider:
     def get_pod(self, pod_id):
@@ -165,3 +168,96 @@ def test_api_requires_auth_and_returns_pods(tmp_path):
     response = client.get("/api/pods")
     assert response.status_code == 200
     assert response.json()[0]["name"] == "riva"
+
+
+def test_schedules_page_requires_auth(tmp_path):
+    app, *_ = _app(tmp_path)
+    client = TestClient(app)
+    response = client.get("/schedules", follow_redirects=False)
+    assert response.status_code in {302, 303, 307}
+
+
+def test_schedule_create_and_render(tmp_path):
+    app, state, *_ = _app(tmp_path)
+    client = _login(TestClient(app))
+    token = _csrf(client)
+    response = client.post(
+        "/schedules",
+        data={
+            "csrf_token": token,
+            "name": "riva-up",
+            "pod": "riva",
+            "action": "recreate",
+            "cron": "15 12 * * 1-6",
+            "timezone": "Etc/UTC",
+            "trigger": "external",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    schedule = state.get_schedule_by_name("riva-up")
+    assert schedule["pod"] == "riva"
+    assert schedule["enabled"] is False
+    page = client.get("/schedules")
+    assert "riva-up" in page.text
+
+
+def test_schedule_create_rejects_bad_cron(tmp_path):
+    app, state, *_ = _app(tmp_path)
+    client = _login(TestClient(app))
+    token = _csrf(client)
+    response = client.post(
+        "/schedules",
+        data={
+            "csrf_token": token,
+            "name": "bad",
+            "pod": "riva",
+            "action": "start",
+            "cron": "nope",
+            "timezone": "Etc/UTC",
+            "trigger": "external",
+        },
+    )
+    assert response.status_code == 400
+    assert "Cron expression" in response.text
+    assert state.list_schedules() == []
+
+
+def test_schedule_toggle_and_run(tmp_path):
+    app, state, runner, *_ = _app(tmp_path)
+    client = _login(TestClient(app))
+    token = _csrf(client)
+    schedule_id = state.create_schedule(
+        "riva-up", "riva", "recreate", "15 12 * * 1-6"
+    )
+    response = client.post(
+        f"/schedules/{schedule_id}/toggle",
+        data={"csrf_token": token},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert state.get_schedule(schedule_id)["enabled"] is True
+
+    response = client.post(
+        f"/schedules/{schedule_id}/run",
+        data={"csrf_token": token},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    for _ in range(50):
+        if runner.calls:
+            break
+        import time
+        time.sleep(0.02)
+    assert runner.calls[0][0:2] == ("riva", "recreate")
+
+
+def test_schedule_mutation_requires_csrf(tmp_path):
+    app, state, *_ = _app(tmp_path)
+    client = _login(TestClient(app))
+    schedule_id = state.create_schedule(
+        "riva-up", "riva", "recreate", "15 12 * * 1-6"
+    )
+    response = client.post(f"/schedules/{schedule_id}/delete", data={})
+    assert response.status_code == 403
+    assert state.get_schedule(schedule_id) is not None

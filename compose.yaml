@@ -5,6 +5,10 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      RUNPOD_OPS_DATA_DIR: /data
+      RUNPOD_OPS_ROOT: /app
+    user: "${RUNPOD_OPS_UID:-10001}:${RUNPOD_OPS_GID:-10001}"
     ports:
       - "8080:8080"
     volumes:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
@@ -10,6 +12,13 @@ from runpod_ops.auth import AuthManager
 from runpod_ops.config import AppConfig
 from runpod_ops.jobs import JobConflict, JobRunner
 from runpod_ops.provider import PodProvider
+from runpod_ops.scheduler import (
+    VALID_TRIGGERS,
+    ScheduleError,
+    ScheduleExecutor,
+    next_run,
+    validate_cron,
+)
 from runpod_ops.state import StateStore
 
 _SESSION_COOKIE = "session"
@@ -24,6 +33,7 @@ def register_routes(
     provider: PodProvider,
     auth: AuthManager,
     templates: Jinja2Templates,
+    executor: ScheduleExecutor,
 ) -> None:
     def session(request: Request) -> str:
         return request.cookies.get(_SESSION_COOKIE, "")
@@ -172,6 +182,167 @@ def register_routes(
         if not state.get_job(job_id):
             raise HTTPException(status_code=404, detail="unknown job")
         return html(request, "_log.html", logs=state.get_logs(job_id))
+
+    def schedule_rows() -> list[dict]:
+        rows = state.list_schedules()
+        for item in rows:
+            try:
+                item["next_calc"] = next_run(item["cron"], item["timezone"])
+            except ScheduleError:
+                item["next_calc"] = "invalid"
+        return rows
+
+    def validate_schedule_form(
+        pod: str, action: str, cron: str, timezone_name: str, trigger: str
+    ) -> None:
+        try:
+            config.get_pod(pod)
+        except KeyError as exc:
+            raise ScheduleError(f"Unknown pod: {pod}") from exc
+        if action not in _ACTIONS:
+            raise ScheduleError(f"Unsupported action: {action}")
+        if trigger not in VALID_TRIGGERS:
+            raise ScheduleError(f"Unsupported trigger: {trigger}")
+        validate_cron(cron, timezone_name)
+
+    @app.get("/schedules", response_class=HTMLResponse)
+    def schedules_page(request: Request, error: str = ""):
+        redirect = require_html(request)
+        if redirect:
+            return redirect
+        return html(
+            request,
+            "schedules.html",
+            schedules=schedule_rows(),
+            pods=config.pods,
+            actions=sorted(_ACTIONS),
+            triggers=sorted(VALID_TRIGGERS),
+            error=error,
+        )
+
+    @app.post("/schedules")
+    def schedule_create(
+        request: Request,
+        name: str = Form(""),
+        pod: str = Form(""),
+        action: str = Form(""),
+        cron: str = Form(""),
+        timezone_name: str = Form("Etc/UTC", alias="timezone"),
+        trigger: str = Form("external"),
+        enabled: str = Form(""),
+        csrf_token: str = Form(""),
+    ):
+        require_csrf(request, csrf_token)
+        try:
+            validate_schedule_form(pod, action, cron, timezone_name, trigger)
+            state.create_schedule(
+                name.strip(),
+                pod,
+                action,
+                cron,
+                timezone_name,
+                trigger,
+                enabled == "on",
+            )
+            state.audit("admin", "schedule_create", pod, name)
+        except Exception as exc:
+            return html(
+                request,
+                "schedules.html",
+                status_code=400,
+                schedules=schedule_rows(),
+                pods=config.pods,
+                actions=sorted(_ACTIONS),
+                triggers=sorted(VALID_TRIGGERS),
+                error=str(exc),
+            )
+        return RedirectResponse("/schedules", status_code=303)
+
+    @app.post("/schedules/{schedule_id}/edit")
+    def schedule_edit(
+        request: Request,
+        schedule_id: int,
+        name: str = Form(""),
+        pod: str = Form(""),
+        action: str = Form(""),
+        cron: str = Form(""),
+        timezone_name: str = Form("Etc/UTC", alias="timezone"),
+        trigger: str = Form("external"),
+        enabled: str = Form(""),
+        csrf_token: str = Form(""),
+    ):
+        require_csrf(request, csrf_token)
+        schedule = state.get_schedule(schedule_id)
+        if not schedule:
+            raise HTTPException(status_code=404, detail="unknown schedule")
+        try:
+            validate_schedule_form(pod, action, cron, timezone_name, trigger)
+            state.update_schedule(
+                schedule_id,
+                name=name.strip(),
+                pod=pod,
+                action=action,
+                cron=cron,
+                timezone=timezone_name,
+                trigger=trigger,
+                enabled=enabled == "on",
+            )
+            state.audit("admin", "schedule_edit", pod, name)
+        except Exception as exc:
+            return html(
+                request,
+                "schedules.html",
+                status_code=400,
+                schedules=schedule_rows(),
+                pods=config.pods,
+                actions=sorted(_ACTIONS),
+                triggers=sorted(VALID_TRIGGERS),
+                error=str(exc),
+            )
+        return RedirectResponse("/schedules", status_code=303)
+
+    @app.post("/schedules/{schedule_id}/toggle")
+    def schedule_toggle(
+        request: Request,
+        schedule_id: int,
+        csrf_token: str = Form(""),
+    ):
+        require_csrf(request, csrf_token)
+        schedule = state.get_schedule(schedule_id)
+        if not schedule:
+            raise HTTPException(status_code=404, detail="unknown schedule")
+        state.update_schedule(schedule_id, enabled=not schedule["enabled"])
+        return RedirectResponse("/schedules", status_code=303)
+
+    @app.post("/schedules/{schedule_id}/delete")
+    def schedule_delete(
+        request: Request,
+        schedule_id: int,
+        csrf_token: str = Form(""),
+    ):
+        require_csrf(request, csrf_token)
+        if not state.get_schedule(schedule_id):
+            raise HTTPException(status_code=404, detail="unknown schedule")
+        state.delete_schedule(schedule_id)
+        return RedirectResponse("/schedules", status_code=303)
+
+    @app.post("/schedules/{schedule_id}/run")
+    def schedule_run(
+        request: Request,
+        schedule_id: int,
+        csrf_token: str = Form(""),
+    ):
+        require_csrf(request, csrf_token)
+        schedule = state.get_schedule(schedule_id)
+        if not schedule:
+            raise HTTPException(status_code=404, detail="unknown schedule")
+        threading.Thread(
+            target=executor.run,
+            args=(schedule,),
+            kwargs={"actor": "admin"},
+            daemon=True,
+        ).start()
+        return RedirectResponse("/schedules", status_code=303)
 
     @app.get("/api/pods")
     def api_pods(request: Request):

@@ -11,6 +11,7 @@
     <a class="brand" href="/">runpod-ops</a>
     <nav>
       <a href="/">Pods</a>
+      <a href="/schedules">Schedules</a>
       {% if csrf_token %}
       <form method="post" action="/logout" class="inline">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

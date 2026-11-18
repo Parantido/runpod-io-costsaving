@@ -10,6 +10,7 @@ import time
 from typing import Callable, Iterable
 
 from runpod_ops.config import PodProfile
+from runpod_ops.locks import PodLockManager
 from runpod_ops.service import Service
 from runpod_ops.state import StateStore
 
@@ -48,12 +49,16 @@ class JobRunner:
         notifier=None,
         command_runner: CommandRunner | None = None,
         poll_interval: float = 0.2,
+        lock_dir=None,
     ):
         self.state = state
         self.service = service
         self.notifier = notifier
         self.command_runner = command_runner or _subprocess_runner
         self.poll_interval = poll_interval
+        self.pod_locks = PodLockManager(
+            lock_dir or service.config.data_dir / "locks"
+        )
         self._queue: queue.Queue = queue.Queue()
         self._active: set[str] = set()
         self._lock = threading.Lock()
@@ -65,6 +70,11 @@ class JobRunner:
         with self._lock:
             if profile.name in self._active:
                 raise JobConflict(f"Pod {profile.name!r} already has an active job")
+        if not self.pod_locks.acquire(profile.name):
+            raise JobConflict(
+                f"Pod {profile.name!r} is locked by another process"
+            )
+        with self._lock:
             self._active.add(profile.name)
         try:
             job_id = self.state.create_job(
@@ -72,8 +82,7 @@ class JobRunner:
             )
             self.state.audit(actor, action, profile.name, f"queued job {job_id}")
         except Exception:
-            with self._lock:
-                self._active.discard(profile.name)
+            self._release(profile.name)
             raise
         self._queue.put((job_id, profile, action, command))
         return job_id
@@ -105,6 +114,7 @@ class JobRunner:
     def _release(self, pod_name: str) -> None:
         with self._lock:
             self._active.discard(pod_name)
+        self.pod_locks.release(pod_name)
 
     def _run(
         self, job_id: str, profile: PodProfile, action: str, command: list[str]
@@ -115,7 +125,6 @@ class JobRunner:
         )
         self._release(profile.name)
         status = "succeeded" if exit_code == 0 else "failed"
-        self.state.finish_job(job_id, status, exit_code)
         if status == "succeeded":
             self.service.record_status(profile, action)
             self.state.audit("system", action, profile.name, f"job {job_id} succeeded")
@@ -130,3 +139,4 @@ class JobRunner:
                 )
             except Exception:
                 logger.exception("notifier failed for job %s", job_id)
+        self.state.finish_job(job_id, status, exit_code)

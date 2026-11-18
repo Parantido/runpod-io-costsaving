@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+{% block title %}Schedules - runpod-ops{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Schedules</h1>
+  <span class="muted">{{ schedules|length }} configured</span>
+</div>
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+<section class="card">
+  <h2>Add schedule</h2>
+  <form method="post" action="/schedules" class="form-grid">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label>Name<input name="name" required placeholder="riva-02-up"></label>
+    <label>Pod
+      <select name="pod" required>
+        {% for pod in pods %}<option value="{{ pod.name }}">{{ pod.name }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>Action
+      <select name="action">{% for action in actions %}<option value="{{ action }}">{{ action }}</option>{% endfor %}</select>
+    </label>
+    <label>Cron<input name="cron" required placeholder="15 12 * * 1-6"></label>
+    <label>Timezone<input name="timezone" value="Etc/UTC"></label>
+    <label>Trigger
+      <select name="trigger">{% for trigger in triggers %}<option value="{{ trigger }}">{{ trigger }}</option>{% endfor %}</select>
+    </label>
+    <label class="check"><input type="checkbox" name="enabled"> Enabled</label>
+    <button type="submit">Create schedule</button>
+  </form>
+</section>
+
+{% if schedules %}
+<table>
+  <thead>
+    <tr>
+      <th>Name</th><th>Pod</th><th>Action</th><th>Cron</th><th>Trigger</th>
+      <th>Enabled</th><th>Last</th><th>Next run</th><th>Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for schedule in schedules %}
+    <tr>
+      <td><strong>{{ schedule.name }}</strong></td>
+      <td><a href="/pods/{{ schedule.pod }}">{{ schedule.pod }}</a></td>
+      <td>{{ schedule.action }}</td>
+      <td><code>{{ schedule.cron }}</code><br><span class="muted">{{ schedule.timezone }}</span></td>
+      <td><span class="status">{{ schedule.trigger }}</span></td>
+      <td>{% if schedule.enabled %}<span class="status status-running">enabled</span>{% else %}<span class="muted">disabled</span>{% endif %}</td>
+      <td>
+        {% if schedule.last_status %}
+          <span class="status status-{{ schedule.last_status }}">{{ schedule.last_status }}</span>
+          {% if schedule.last_job_id %}<br><a href="/jobs/{{ schedule.last_job_id }}"><code>{{ schedule.last_job_id[:10] }}</code></a>{% endif %}
+        {% else %}<span class="muted">-</span>{% endif %}
+      </td>
+      <td class="muted">{{ schedule.next_calc }}</td>
+      <td class="actions">
+        <form method="post" action="/schedules/{{ schedule.id }}/run" class="inline">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="btn-start">run now</button>
+        </form>
+        <form method="post" action="/schedules/{{ schedule.id }}/toggle" class="inline">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit">{{ "disable" if schedule.enabled else "enable" }}</button>
+        </form>
+        <form method="post" action="/schedules/{{ schedule.id }}/delete" class="inline">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="btn-terminate">delete</button>
+        </form>
+      </td>
+    </tr>
+    <tr class="edit-row">
+      <td colspan="9">
+        <details>
+          <summary>Edit {{ schedule.name }}</summary>
+          <form method="post" action="/schedules/{{ schedule.id }}/edit" class="form-grid">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <label>Name<input name="name" value="{{ schedule.name }}" required></label>
+            <label>Pod
+              <select name="pod">
+                {% for pod in pods %}<option value="{{ pod.name }}" {% if pod.name == schedule.pod %}selected{% endif %}>{{ pod.name }}</option>{% endfor %}
+              </select>
+            </label>
+            <label>Action
+              <select name="action">
+                {% for action in actions %}<option value="{{ action }}" {% if action == schedule.action %}selected{% endif %}>{{ action }}</option>{% endfor %}
+              </select>
+            </label>
+            <label>Cron<input name="cron" value="{{ schedule.cron }}" required></label>
+            <label>Timezone<input name="timezone" value="{{ schedule.timezone }}"></label>
+            <label>Trigger
+              <select name="trigger">
+                {% for trigger in triggers %}<option value="{{ trigger }}" {% if trigger == schedule.trigger %}selected{% endif %}>{{ trigger }}</option>{% endfor %}
+              </select>
+            </label>
+            <label class="check"><input type="checkbox" name="enabled" {% if schedule.enabled %}checked{% endif %}> Enabled</label>
+            <button type="submit">Save changes</button>
+          </form>
+        </details>
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<section class="card"><p class="muted">No schedules yet. Add one above.</p></section>
+{% endif %}
+{% endblock %}

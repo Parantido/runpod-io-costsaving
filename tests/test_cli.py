@@ -26,10 +26,19 @@ class FakeRunner:
         return self.status
 
 
+class FakeService:
+    def __init__(self, state):
+        self.state = state
+
+    def adopt(self, profile, pod_id):
+        self.state.upsert_pod(profile.name, pod_id, "UNKNOWN")
+
+
 class FakeComponents:
     def __init__(self, state, runner):
         self.state = state
         self.runner = runner
+        self.service = FakeService(state)
         self.provider = None
 
 
@@ -105,3 +114,82 @@ def test_pods_lists_configured_names(tmp_path, capsys):
     )
     assert code == 0
     assert "riva" in capsys.readouterr().out
+
+
+def test_adopt_records_pod_id(tmp_path):
+    config, components = _components(tmp_path)
+    code = cli.main(
+        ["adopt", "riva", "pod-42"],
+        components_factory=lambda cfg: components,
+        config_loader=lambda path: config,
+    )
+    assert code == 0
+    assert components.state.get_pod("riva")["pod_id"] == "pod-42"
+
+
+def test_schedule_add_and_list(tmp_path, capsys):
+    config, components = _components(tmp_path)
+    code = cli.main(
+        [
+            "schedule",
+            "add",
+            "riva-up",
+            "--pod",
+            "riva",
+            "--action",
+            "recreate",
+            "--cron",
+            "15 12 * * 1-6",
+            "--trigger",
+            "external",
+        ],
+        components_factory=lambda cfg: components,
+        config_loader=lambda path: config,
+    )
+    assert code == 0
+    capsys.readouterr()
+    code = cli.main(
+        ["schedules"],
+        components_factory=lambda cfg: components,
+        config_loader=lambda path: config,
+    )
+    assert code == 0
+    output = capsys.readouterr().out
+    assert "riva-up" in output
+    assert "external" in output
+
+
+def test_schedule_add_rejects_bad_cron(tmp_path, capsys):
+    config, components = _components(tmp_path)
+    code = cli.main(
+        [
+            "schedule",
+            "add",
+            "bad",
+            "--pod",
+            "riva",
+            "--action",
+            "start",
+            "--cron",
+            "nope",
+        ],
+        components_factory=lambda cfg: components,
+        config_loader=lambda path: config,
+    )
+    assert code == 2
+    assert "Cron expression" in capsys.readouterr().err
+
+
+def test_schedule_run_executes(tmp_path, capsys):
+    config, components = _components(tmp_path)
+    components.state.create_schedule(
+        "riva-up", "riva", "recreate", "15 12 * * 1-6"
+    )
+    code = cli.main(
+        ["schedule", "run", "riva-up"],
+        components_factory=lambda cfg: components,
+        config_loader=lambda path: config,
+    )
+    assert code == 0
+    assert components.runner.submitted == [("riva", "recreate", "cli")]
+    assert "engine output" in capsys.readouterr().out

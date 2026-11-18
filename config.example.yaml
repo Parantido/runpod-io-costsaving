@@ -1,5 +1,5 @@
 # Copy to config.yaml. Keep secrets in .env, not here.
-data_dir: /data
+data_dir: /root/mgmt/runpod/data
 
 server:
   host: 0.0.0.0

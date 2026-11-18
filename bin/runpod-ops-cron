@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+
+ROOT="${RUNPOD_OPS_ROOT:-/root/mgmt/runpod}"
+
+if [ -f "$ROOT/.env" ]; then
+    set -a
+    . "$ROOT/.env"
+    set +a
+fi
+
+export RUNPOD_OPS_ROOT="$ROOT"
+export RUNPOD_OPS_DATA_DIR="${RUNPOD_OPS_DATA_DIR:-$ROOT/data}"
+
+exec "$ROOT/.venv/bin/runpod-ops" --config "$ROOT/config.yaml" "$@"

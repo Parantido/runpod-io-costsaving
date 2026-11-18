@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -13,6 +14,7 @@ from runpod_ops.config import AppConfig
 from runpod_ops.jobs import JobRunner
 from runpod_ops.notifiers import EmailNotifier
 from runpod_ops.provider import PodProvider, RunPodProvider
+from runpod_ops.scheduler import ScheduleExecutor, Scheduler
 from runpod_ops.service import Service
 from runpod_ops.state import StateStore
 from runpod_ops.web.routes import register_routes
@@ -27,6 +29,7 @@ def create_app(
     runner: JobRunner | None = None,
     provider: PodProvider | None = None,
     auth: AuthManager | None = None,
+    start_scheduler: bool = False,
 ) -> FastAPI:
     state = state or StateStore(config.data_dir / "runpod_ops.db")
     state.init_schema()
@@ -40,15 +43,36 @@ def create_app(
 
     provider = provider or RunPodProvider(config.runpod.api_key_file)
     auth = auth or AuthManager(config.admin_password, config.secret_key)
+    executor = ScheduleExecutor(state, config, runner)
+    scheduler = Scheduler(state, executor)
 
-    app = FastAPI(title="runpod-ops", docs_url=None, redoc_url=None)
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        if start_scheduler:
+            scheduler.start()
+        try:
+            yield
+        finally:
+            if start_scheduler:
+                scheduler.stop()
+
+    app = FastAPI(
+        title="runpod-ops",
+        docs_url=None,
+        redoc_url=None,
+        lifespan=lifespan,
+    )
     app.state.config = config
     app.state.store = state
     app.state.runner = runner
     app.state.provider = provider
     app.state.auth = auth
+    app.state.executor = executor
+    app.state.scheduler = scheduler
     app.mount("/static", StaticFiles(directory=_STATIC), name="static")
 
     templates = Jinja2Templates(directory=str(_TEMPLATES))
-    register_routes(app, config, state, runner, provider, auth, templates)
+    register_routes(
+        app, config, state, runner, provider, auth, templates, executor
+    )
     return app

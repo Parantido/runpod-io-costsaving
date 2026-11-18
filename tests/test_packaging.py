@@ -20,6 +20,8 @@ def test_required_packaging_files_exist():
         "pyproject.toml",
         ".github/workflows/ci.yml",
         "legacy/README.md",
+        "bin/runpod-ops-cron",
+        "hooks/README.md",
     ):
         assert (ROOT / name).is_file(), name
 
@@ -75,7 +77,6 @@ def test_legacy_scripts_are_isolated():
         "start.sh",
         "stop.sh",
         "info.sh",
-        "update-webservice.sh",
         "test_alerts.sh",
         "dry_run_restart.py",
         "llm_lifecycle.py",
@@ -83,3 +84,32 @@ def test_legacy_scripts_are_isolated():
     ):
         assert not (ROOT / name).exists(), name
         assert (ROOT / "legacy" / name).exists(), name
+    assert (ROOT / "update-webservice.sh").is_symlink()
+    assert (ROOT / "update-webservice.sh").resolve() == (
+        ROOT / "legacy" / "update-webservice.sh"
+    ).resolve()
+
+
+def test_host_cron_wrapper_is_executable():
+    wrapper = ROOT / "bin" / "runpod-ops-cron"
+    assert wrapper.is_file()
+    assert os.access(wrapper, os.X_OK)
+    text = wrapper.read_text()
+    assert ".env" in text
+    assert "RUNPOD_OPS_DATA_DIR" in text
+    assert "runpod-ops" in text
+
+
+def test_dockerfile_uses_shared_product_root():
+    text = (ROOT / "Dockerfile").read_text()
+    assert "WORKDIR /app" in text
+    assert "RUNPOD_OPS_ROOT=/app" in text
+    assert "COPY hooks" in text
+    assert "COPY runpod_costsaving.py" in text
+
+
+def test_compose_overrides_data_dir_and_root():
+    text = (ROOT / "compose.yaml").read_text()
+    assert "RUNPOD_OPS_DATA_DIR: /data" in text
+    assert "RUNPOD_OPS_ROOT: /app" in text
+    assert "RUNPOD_OPS_UID" in text

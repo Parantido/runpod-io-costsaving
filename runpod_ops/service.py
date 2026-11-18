@@ -51,6 +51,15 @@ class Service:
         row = self.state.get_pod(profile.name)
         return row.get("pod_id") if row else None
 
+    def adopt(self, profile: PodProfile, pod_id: str) -> None:
+        pod_id = pod_id.strip()
+        if not pod_id:
+            raise ServiceError("Pod ID is required")
+        path = self.pod_id_file(profile)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(pod_id + "\n")
+        self.state.upsert_pod(profile.name, pod_id, "UNKNOWN")
+
     def sync_pod_id(self, profile: PodProfile) -> str | None:
         path = self.pod_id_file(profile)
         try:
